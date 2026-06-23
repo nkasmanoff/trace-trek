@@ -13,6 +13,7 @@ venv/
 pipeline/raw/
 pipeline/dataset/
 pipeline/**/*.jsonl
+!pipeline/eval/eval-tasks.jsonl
 pipeline/eval/eval-results.json
 pipeline/eval/runs/
 pipeline/**/results-*.json

@@ -49,7 +49,7 @@ def pick(tasks: list[dict], n: int, seed: int) -> list[dict]:
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--tasks", type=Path, default=BASE / "tasks-test.jsonl")
-    p.add_argument("--n", type=int, default=6, help="size of the eval set")
+    p.add_argument("--n", type=int, default=10, help="size of the eval set")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out", type=Path, default=BASE / "eval" / "eval-tasks.jsonl")
     args = p.parse_args()

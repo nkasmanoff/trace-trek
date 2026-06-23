@@ -64,3 +64,4 @@ results-*.jsonl
 .ruff_cache/
 
 **.jsonl
+!eval/eval-tasks.jsonl
