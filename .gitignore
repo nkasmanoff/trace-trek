@@ -1,0 +1,36 @@
+# Root ignores
+data/
+.env
+node_modules/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.DS_Store
+
+# Pipeline artifacts (pipeline has its own .gitignore)
+pipeline/raw/
+pipeline/dataset/
+pipeline/**/*.jsonl
+pipeline/eval/eval-results.json
+pipeline/eval/runs/
+pipeline/**/results-*.json
+pipeline/**/results-*.jsonl
+pipeline/**/*.log
+pipeline/**/wandb/
+pipeline/**/*.ckpt
+pipeline/**/*.pt
+pipeline/**/*.pth
+pipeline/**/checkpoint-*/
+
+# Viewer build artifacts
+viewer/node_modules/
+viewer/dist/
+viewer/.vite/
+
+# Compiled macOS app (source is in menubar/Sources/)
+menubar/*.app
+
+# Generated reports
+pipeline/REPORT.md

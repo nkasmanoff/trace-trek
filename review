@@ -1,0 +1,152 @@
+#!/usr/bin/env node
+const fs = require("fs");
+const path = require("path");
+const { execSync, spawn } = require("child_process");
+const readline = require("readline");
+
+const SNAP_DIR = path.join(__dirname, ".review-snapshots");
+const INDEX_FILE = path.join(SNAP_DIR, ".index");
+
+const RED = "\x1b[31m";
+const GREEN = "\x1b[32m";
+const CYAN = "\x1b[36m";
+const BOLD = "\x1b[1m";
+const DIM = "\x1b[2m";
+const RESET = "\x1b[0m";
+
+const EXTENSIONS = new Set([
+  ".js", ".ts", ".jsx", ".tsx", ".py", ".rs", ".go", ".java", ".rb", ".php",
+  ".c", ".cpp", ".h", ".hpp", ".cs", ".swift", ".kt", ".scala", ".mjs", ".cjs",
+  ".json", ".yaml", ".yml", ".toml", ".md", ".css", ".scss", ".html", ".vue",
+  ".svelte", ".astro", ".mdx",
+]);
+
+function findProjectFiles(dir) {
+  const files = [];
+  function walk(d) {
+    let entries;
+    try { entries = fs.readdirSync(d); } catch { return; }
+    for (const e of entries) {
+      if (e.startsWith(".") || e === "node_modules" || e === "dist" || e === "build" || e === ".review-snapshots") continue;
+      const p = path.join(d, e);
+      let stat;
+      try { stat = fs.statSync(p); } catch { continue; }
+      if (stat.isDirectory()) walk(p);
+      else if (EXTENSIONS.has(path.extname(e))) files.push(p);
+    }
+  }
+  walk(dir);
+  return files;
+}
+
+function saveSnapshot(file) {
+  const abs = path.resolve(file);
+  if (!fs.existsSync(abs)) { console.error(`  File not found: ${file}`); return; }
+  fs.mkdirSync(SNAP_DIR, { recursive: true });
+  const id = Buffer.from(abs).toString("base64url");
+  const dest = path.join(SNAP_DIR, id);
+  fs.copyFileSync(abs, dest);
+  const idx = fs.existsSync(INDEX_FILE) ? JSON.parse(fs.readFileSync(INDEX_FILE, "utf8")) : [];
+  if (!idx.find((e) => e.abs === abs)) idx.push({ abs, id });
+  fs.writeFileSync(INDEX_FILE, JSON.stringify(idx, null, 2));
+  console.log(`  ${DIM}snapshot: ${path.basename(file)}${RESET}`);
+}
+
+function colorDiff(text) {
+  return text.split("\n").map((line) => {
+    if (line.startsWith("+") && !line.startsWith("+++")) return GREEN + line + RESET;
+    if (line.startsWith("-") && !line.startsWith("---")) return RED + line + RESET;
+    if (line.startsWith("@")) return CYAN + line + RESET;
+    return line;
+  }).join("\n");
+}
+
+function ask(query) {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((resolve) => rl.question(query, (a) => { rl.close(); resolve(a.trim().toLowerCase()); }));
+}
+
+async function review() {
+  if (!fs.existsSync(INDEX_FILE)) {
+    console.log("  No snapshots found.");
+    return;
+  }
+  const idx = JSON.parse(fs.readFileSync(INDEX_FILE, "utf8"));
+  let hasChanges = false;
+  for (const entry of idx) {
+    const currentPath = entry.abs;
+    const snapshotPath = path.join(SNAP_DIR, entry.id);
+    if (!fs.existsSync(currentPath)) {
+      hasChanges = true;
+      console.log(`\n${BOLD}${path.basename(currentPath)}${RESET} — ${RED}deleted${RESET}`);
+      const a = await ask(`  Restore? (y/n/q) `);
+      if (a === "q") return;
+      if (a === "y") { fs.copyFileSync(snapshotPath, currentPath); console.log(`  ${GREEN}restored${RESET}`); }
+      continue;
+    }
+    const original = fs.readFileSync(snapshotPath, "utf8");
+    const current = fs.readFileSync(currentPath, "utf8");
+    if (original === current) continue;
+    hasChanges = true;
+
+    console.log(`\n${BOLD}${path.basename(currentPath)}${RESET}  ${DIM}(modified)${RESET}`);
+    let diffOutput = "";
+    try {
+      diffOutput = execSync(`diff -u "${snapshotPath}" "${currentPath}"`, { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] });
+    } catch (e) {
+      diffOutput = e.stdout || "";
+    }
+    console.log(colorDiff(diffOutput));
+    const a = await ask(`  Accept? (Y/n/q) `);
+    if (a === "q") return;
+    if (a === "n") {
+      fs.copyFileSync(snapshotPath, currentPath);
+      console.log(`  ${RED}reverted${RESET}`);
+    } else {
+      console.log(`  ${GREEN}accepted${RESET}`);
+    }
+  }
+  if (!hasChanges) console.log("  No changes detected.");
+}
+
+const cmd = process.argv[2];
+const files = process.argv.slice(3);
+
+if (cmd === "snapshot") {
+  for (const f of files) saveSnapshot(f);
+} else if (cmd === "clean") {
+  fs.rmSync(SNAP_DIR, { recursive: true, force: true });
+  console.log("  snapshots cleared");
+} else if (cmd === "status") {
+  if (!fs.existsSync(INDEX_FILE)) { console.log("  No snapshots."); return; }
+  let changed = 0;
+  for (const e of JSON.parse(fs.readFileSync(INDEX_FILE, "utf8"))) {
+    const snap = fs.readFileSync(path.join(SNAP_DIR, e.id), "utf8");
+    const cur = fs.existsSync(e.abs) ? fs.readFileSync(e.abs, "utf8") : null;
+    const name = path.basename(e.abs);
+    if (cur === null) { console.log(`  ${RED}deleted${RESET}  ${name}`); changed++; }
+    else if (snap !== cur) { console.log(`  ${CYAN}modified${RESET}  ${name}`); changed++; }
+    else { console.log(`  ${DIM}unchanged${RESET}  ${name}`); }
+  }
+  if (changed === 0) console.log("  No changes detected.");
+} else if (cmd === "opencode") {
+  // Wrapper: snapshot all files, run opencode, then review
+  const projectDir = files[0] || ".";
+  const absDir = path.resolve(projectDir);
+  console.log(`${BOLD}review${RESET} — snapshotting all project files...`);
+  const allFiles = findProjectFiles(absDir);
+  for (const f of allFiles) saveSnapshot(f);
+  const n = JSON.parse(fs.readFileSync(INDEX_FILE, "utf8")).length;
+  console.log(`  ${DIM}tracking ${n} files${RESET}\n`);
+
+  console.log(`${BOLD}Starting opencode...${RESET}`);
+  const child = spawn("opencode", [], { stdio: "inherit", cwd: absDir, env: { ...process.env } });
+  child.on("exit", async (code) => {
+    console.log(`\n${BOLD}review${RESET} — checking for changes...`);
+    await review();
+  });
+} else if (files.length > 0) {
+  for (const f of files) saveSnapshot(f);
+} else {
+  review();
+}

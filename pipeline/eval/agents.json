@@ -1,0 +1,23 @@
+[
+  {
+    "label": "opus-4.8",
+    "model": "frontier/anthropic/claude-opus-4.8",
+    "agent": null,
+    "no_synth": false,
+    "extra": []
+  },
+  {
+    "label": "sonnet-4.6",
+    "model": "frontier/anthropic/claude-sonnet-4.6",
+    "agent": null,
+    "no_synth": false,
+    "extra": []
+  },
+  {
+    "label": "laguna-xs.2",
+    "model": "frontier/poolside/laguna-xs.2",
+    "agent": null,
+    "no_synth": false,
+    "extra": []
+  }
+]

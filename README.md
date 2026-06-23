@@ -1,5 +1,9 @@
 # trace-trek
 
+<p align="center">
+  <img src="assets/menubar-tracer.png" alt="TraceTrek Menubar" width="600">
+</p>
+
 Monorepo for the opencode self-improvement loop: collect agent traces, visualize them, build datasets, train models, evaluate, and deploy.
 
 ## Structure
@@ -9,7 +13,6 @@ trace-trek/
 ├── viewer/                          # Trace visualization (Vite + React)
 │   ├── src/                         # React app (anatomy view, dashboard, eval tab)
 │   ├── server/                      # Vite middleware: DB access, SFT export, HF upload
-│   ├── trace-anatomy.html           # Standalone zero-dep viewer (drop a file in)
 │   └── vite.config.js
 │
 ├── pipeline/                        # Self-improvement loop
@@ -43,7 +46,6 @@ npm run dev          # opens Vite dev server at localhost:5173
 The viewer connects to opencode's SQLite DB and can export sessions as SFT
 training data and upload them directly to HuggingFace.
 
-Or just open `viewer/trace-anatomy.html` in a browser — it's fully self-contained. Drag in a trace JSON file and explore turns, tool calls, and dead ends.
 
 ### Pipeline (pull dataset → train → eval → deploy)
 
@@ -73,6 +75,6 @@ opencode SQLite DB  ──>  viewer app  ──>  HuggingFace  ──>  train.py
 
 ## Key integrations
 
-- **viewer ↔ pipeline:** `viewer/server/filter.js` shells out to `pipeline/dataset/build_dataset.py` for the quality gate when exporting SFT data. `pipeline/eval/embed_eval.py` bakes eval results into `viewer/trace-anatomy.html` so the Eval tab is pre-loaded.
+- **viewer ↔ pipeline:** `viewer/server/filter.js` shells out to `pipeline/dataset/build_dataset.py` for the quality gate when exporting SFT data.
 - **viewer → opencode DB:** The dev server connects to opencode's SQLite DB for session listing and analytics.
 - **pipeline → HF:** SFT datasets can be uploaded to Hugging Face via the viewer's UI or `scripts/upload_to_hf.py`.

@@ -1,0 +1,28 @@
+;; Write-confinement profile for replayed opencode runs (macOS sandbox-exec).
+;;
+;; Reads and network are unrestricted; file WRITES are denied everywhere
+;; except the tmp worktree area and opencode's own state/cache dirs. This
+;; guarantees a replayed agent cannot modify real repositories, no matter
+;; what command it decides to run.
+;;
+;; Worktrees live under $TMPDIR (/private/var/folders/...), which is covered
+;; by the subpaths below, so one static profile serves every task.
+
+(version 1)
+(allow default)
+
+(deny file-write*)
+
+(allow file-write*
+  ;; tmp areas — replay worktrees, pty transcripts, scratch
+  (subpath "/private/var/folders")
+  (subpath "/private/tmp")
+  (subpath "/tmp")
+  ;; terminal devices for the pseudo-TTY
+  (regex #"^/dev/")
+  ;; opencode + bun runtime state
+  (subpath (string-append (param "HOME") "/.local/share/opencode"))
+  (subpath (string-append (param "HOME") "/.local/state"))
+  (subpath (string-append (param "HOME") "/.cache"))
+  (subpath (string-append (param "HOME") "/.bun"))
+  (subpath (string-append (param "HOME") "/Library/Caches")))
