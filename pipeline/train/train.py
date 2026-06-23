@@ -1,34 +1,82 @@
 #!/usr/bin/env python3
 """QLoRA fine-tune a local code model on collected traces. Runs on a CUDA GPU.
 
-Tries Unsloth first (fastest, lowest VRAM); falls back to plain
-transformers + PEFT + TRL if Unsloth can't load the brand-new
-`cohere2_moe` architecture.
+Defaults to `poolside/Laguna-XS.2` (33B-total / 3B-active MoE). Tries Unsloth
+first (fastest, lowest VRAM); falls back to plain transformers + PEFT + TRL if
+Unsloth can't load the architecture (the likely path for Laguna today).
+
+Loss is masked to assistant turns only. Laguna's chat template marks assistant
+spans with Jinja `{% generation %}` blocks, so we get an exact assistant-token
+mask straight from `apply_chat_template(..., return_assistant_tokens_mask=True)`
+— no brittle string matching. For chat formats whose template lacks generation
+blocks (e.g. Cohere), we fall back to masking between configured turn markers.
 
 Input:
-    --data sft.jsonl from build_dataset.py or --hf-repo to pull from HF
-    ({"messages": [...], "tools": [...]|null, "source": ...} per line)
+    --data sft.jsonl (one {"messages": [...], "tools": [...]|null, "source": ...}
+        per line) or --hf-repo to pull from HF. A single-split HF dataset (e.g.
+        nkasmanoff/opencode-sft) is split into train/eval via --eval-frac.
 Output: <out>/adapter/  (LoRA weights)
         <out>/merged/   (merged bf16 checkpoint, ready for GGUF conversion)
 
 Usage (on the pod):
-    python train.py --data sft.jsonl --out outputs \
-        [--base CohereLabs/local-code-model] [--max-seq-len 65536] \
-        [--epochs 2] [--lr 1e-4] [--lora-r 16] [--include-mlp]
+    # Pull + split a single-split HF dataset and train Laguna:
+    python train.py --hf-repo nkasmanoff/opencode-sft --out outputs
 
-    # Or pull from HuggingFace:
-    python train.py --hf-repo nkasmanoff/local-code-sft-json --out outputs
+    # Local files (e.g. from pull_dataset.py / `make split`):
+    python train.py --data dataset/sft.jsonl --eval-data dataset/sft-eval.jsonl \
+        --out outputs --epochs 3 --lr 5e-5
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 from pathlib import Path
 
-RESPONSE_MARKER = "<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>"
-INSTRUCTION_MARKER = "<|START_OF_TURN_TOKEN|><|USER_TOKEN|>"
-END_OF_TURN_TOKEN = "<|END_OF_TURN_TOKEN|>"
+LAGUNA_BASE = "poolside/Laguna-XS.2"
+# FP8 (compressed-tensors) build: the MoE experts are FP8-compressed while the
+# attention projections stay bf16, so the model fits on one 80GB H100 and LoRA
+# wraps the un-quantized attention linears. This is the default because plain
+# bitsandbytes 4-bit can't quantize Laguna's fused `LagunaExperts` module (94%
+# of params), so QLoRA loads the model near full bf16 size and OOMs.
+LAGUNA_FP8_BASE = "poolside/Laguna-XS.2-FP8"
+
+# Per-chat-format settings. `apply_chat_template(return_assistant_tokens_mask=
+# True)` is preferred for masking; the marker fields are only used as a fallback
+# when a template has no `{% generation %}` blocks (so no assistant mask).
+CHAT_FORMATS = {
+    "laguna": {
+        # template reads reasoning straight from message.reasoning_content
+        "rename_reasoning": False,
+        # dataset stores tool_call arguments as JSON strings; the template
+        # iterates arguments.items(), so they must be parsed back to dicts
+        "normalize_tool_args": True,
+        "template_kwargs": {"enable_thinking": True},
+        "response_marker": "<assistant>\n",
+        "instruction_marker": "<user>\n",
+        "end_marker": "</assistant>",
+        # (label, needle) pairs the preflight requires in a rendered sample
+        "preflight_needles": [
+            ("assistant turn", "<assistant>"),
+            ("reasoning/think", "PREFLIGHT_THINK"),
+            ("tool call", "<tool_call>calc"),
+        ],
+    },
+    "cohere": {
+        "rename_reasoning": True,
+        "normalize_tool_args": False,
+        "template_kwargs": {},
+        "response_marker": "<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>",
+        "instruction_marker": "<|START_OF_TURN_TOKEN|><|USER_TOKEN|>",
+        "end_marker": "<|END_OF_TURN_TOKEN|>",
+        "preflight_needles": [
+            ("response marker", "<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>"),
+            ("reasoning/thinking", "PREFLIGHT_THINK"),
+            ("tool name", "calc"),
+        ],
+    },
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -37,13 +85,28 @@ def parse_args() -> argparse.Namespace:
                    help="local sft jsonl file (mutually exclusive with --hf-repo)")
     p.add_argument("--hf-repo", default=None,
                    help="HuggingFace dataset repo to pull from, e.g. "
-                        "nkasmanoff/local-code-sft-json")
+                        "nkasmanoff/opencode-sft")
     p.add_argument("--eval-data", type=Path, default=None,
                    help="held-out sft jsonl; if set, eval loss is computed "
                         "every --eval-steps")
+    p.add_argument("--eval-frac", type=float, default=0.1,
+                   help="when --hf-repo has only a train split, hold out this "
+                        "fraction for eval")
     p.add_argument("--eval-steps", type=int, default=20)
     p.add_argument("--out", type=Path, default=Path("outputs"))
-    p.add_argument("--base", default="CohereLabs/local-code-model")
+    p.add_argument("--base", default=LAGUNA_FP8_BASE)
+    p.add_argument("--quant", choices=["auto", "fp8", "4bit", "none"],
+                   default="auto",
+                   help="base-model quantization. auto: 'fp8' (native "
+                        "compressed-tensors) for *-FP8 repos, else '4bit' "
+                        "(bitsandbytes QLoRA). 'none' loads bf16 (needs lots of "
+                        "VRAM / multiple GPUs).")
+    p.add_argument("--chat-format", choices=["auto", "laguna", "cohere"],
+                   default="auto",
+                   help="chat template family (auto-detected from --base)")
+    # Laguna sequences are long (opencode-sft: mean ~30k, p95 ~79k tokens).
+    # 65536 keeps roughly the shorter ~90% of samples; lower it (e.g. 32768)
+    # if a single 80GB H100 OOMs at this context length.
     p.add_argument("--max-seq-len", type=int, default=65536)
     p.add_argument("--epochs", type=float, default=2.0)
     p.add_argument("--lr", type=float, default=1e-4)
@@ -55,9 +118,13 @@ def parse_args() -> argparse.Namespace:
         "--include-mlp", action="store_true",
         help="also adapt expert FFN projections (more VRAM, more capacity)",
     )
+    p.add_argument("--no-liger", action="store_true",
+                   help="disable the Liger fused-linear cross-entropy patch "
+                        "(it avoids materializing the [seq, vocab] logits "
+                        "tensor, so longer context fits in memory)")
     p.add_argument("--no-merge", action="store_true",
                    help="skip writing the merged bf16 checkpoint")
-    p.add_argument("--wandb-project", default="local-code-sft",
+    p.add_argument("--wandb-project", default="laguna-sft",
                    help="W&B project; logging activates when WANDB_API_KEY "
                         "is set (use --no-wandb to force off)")
     p.add_argument("--run-name", default=None,
@@ -66,7 +133,28 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def setup_wandb(args, n_train: int, n_eval: int) -> str | None:
+def resolve_quant(args) -> str:
+    if args.quant != "auto":
+        return args.quant
+    base = (args.base or "").lower()
+    if "fp8" in base or "compressed" in base:
+        return "fp8"
+    return "4bit"
+
+
+def resolve_chat_format(args) -> str:
+    if args.chat_format != "auto":
+        return args.chat_format
+    base = (args.base or "").lower()
+    if "laguna" in base:
+        return "laguna"
+    if any(k in base for k in ("cohere", "command", "north-mini", "north_mini")):
+        return "cohere"
+    # default base is Laguna; assume laguna for unknown ids
+    return "laguna"
+
+
+def setup_wandb(args, fmt: str, n_train: int, n_eval: int) -> str | None:
     """Init W&B if a key is available. Returns run name or None."""
     import os
     if args.no_wandb or not os.environ.get("WANDB_API_KEY"):
@@ -74,13 +162,14 @@ def setup_wandb(args, n_train: int, n_eval: int) -> str | None:
     import time
     import wandb
     run_name = args.run_name or (
-        f"sft-{n_train}samp-r{args.lora_r}-lr{args.lr:g}"
+        f"sft-{fmt}-{n_train}samp-r{args.lora_r}-lr{args.lr:g}"
         f"-{time.strftime('%m%d-%H%M')}")
     wandb.init(
         project=args.wandb_project,
         name=run_name,
         config={
             "base_model": args.base,
+            "chat_format": fmt,
             "n_train_samples": n_train,
             "n_eval_samples": n_eval,
             "max_seq_len": args.max_seq_len,
@@ -105,28 +194,99 @@ def lora_targets(include_mlp: bool) -> list[str]:
     return targets
 
 
-def render_messages(rec: dict, tokenizer) -> str:
-    """Render one record's conversation with the model's chat template."""
+def prepare_messages(rec: dict, fmt_cfg: dict) -> list[dict]:
+    """Normalize one record's messages for the target chat template."""
     messages = []
     for m in rec["messages"]:
         m = dict(m)
-        # the official template renders assistant thinking via msg.thinking
-        if m.get("reasoning_content"):
+        if fmt_cfg["rename_reasoning"] and m.get("reasoning_content"):
+            # the Cohere template renders assistant thinking via msg.thinking
             m["thinking"] = m.pop("reasoning_content")
+        if fmt_cfg["normalize_tool_args"] and m.get("tool_calls"):
+            tcs = []
+            for tc in m["tool_calls"]:
+                tc = copy.deepcopy(tc)
+                fn = tc.get("function") or {}
+                args = fn.get("arguments")
+                if isinstance(args, str):
+                    try:
+                        fn["arguments"] = json.loads(args)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                tcs.append(tc)
+            m["tool_calls"] = tcs
         messages.append(m)
+    return messages
+
+
+def render_text(rec: dict, tokenizer, fmt_cfg: dict) -> str:
+    """Render a record to text (for the human-readable preflight check)."""
     return tokenizer.apply_chat_template(
-        messages,
+        prepare_messages(rec, fmt_cfg),
         tools=rec.get("tools") or None,
         tokenize=False,
         add_generation_prompt=False,
+        **fmt_cfg["template_kwargs"],
     )
 
 
-def preflight_template(tokenizer) -> None:
-    """Fail loudly (before loading the model fully matters) if the chat
-    template can't render reasoning + tool calls. A bare try/except in the
-    data loader would otherwise silently drop every agentic sample and train
-    on nothing useful."""
+def _find(haystack: list[int], needle: list[int], start: int) -> int:
+    if not needle:
+        return -1
+    for i in range(start, len(haystack) - len(needle) + 1):
+        if haystack[i:i + len(needle)] == needle:
+            return i
+    return -1
+
+
+def marker_mask(ids: list[int], resp_ids: list[int],
+                end_ids: list[int]) -> list[int]:
+    """Fallback assistant mask: 1 between a response marker and the following
+    end-of-turn token (inclusive of the end token so the model learns to stop).
+    Used only when the template has no `{% generation %}` blocks."""
+    mask = [0] * len(ids)
+    pos = 0
+    while True:
+        start = _find(ids, resp_ids, pos)
+        if start == -1:
+            break
+        span_start = start + len(resp_ids)
+        end = _find(ids, end_ids, span_start) if end_ids else -1
+        span_end = (end + len(end_ids)) if end != -1 else len(ids)
+        for i in range(span_start, span_end):
+            mask[i] = 1
+        pos = span_end
+    return mask
+
+
+def tokenize_record(rec: dict, tokenizer, fmt_cfg: dict,
+                    resp_ids: list[int], end_ids: list[int],
+                    ) -> tuple[list[int], list[int]]:
+    """Return (input_ids, assistant_mask) for one record. Prefers the chat
+    template's `{% generation %}` mask; falls back to marker masking."""
+    messages = prepare_messages(rec, fmt_cfg)
+    tools = rec.get("tools") or None
+    enc = tokenizer.apply_chat_template(
+        messages,
+        tools=tools,
+        tokenize=True,
+        return_dict=True,
+        return_assistant_tokens_mask=True,
+        add_generation_prompt=False,
+        **fmt_cfg["template_kwargs"],
+    )
+    ids = list(enc["input_ids"])
+    mask = enc.get("assistant_masks")
+    if not mask or sum(mask) == 0:
+        mask = marker_mask(ids, resp_ids, end_ids)
+    return ids, list(mask)
+
+
+def preflight_template(tokenizer, fmt_cfg: dict,
+                       resp_ids: list[int], end_ids: list[int]) -> None:
+    """Fail loudly if the chat template can't render/mask reasoning + tool
+    calls. A bare try/except in the data loader would otherwise silently drop
+    every agentic sample and train on nothing useful."""
     rec = {
         "messages": [
             {"role": "system", "content": "You are a helpful assistant."},
@@ -153,7 +313,7 @@ def preflight_template(tokenizer) -> None:
                 }}}],
     }
     try:
-        text = render_messages(rec, tokenizer)
+        text = render_text(rec, tokenizer, fmt_cfg)
     except Exception as exc:  # noqa: BLE001
         raise SystemExit(
             f"FATAL: chat template failed to render a tool-call + reasoning "
@@ -161,11 +321,8 @@ def preflight_template(tokenizer) -> None:
             f"reasoning_content); a template that can't render them would "
             f"drop every sample. Check the tokenizer for {tokenizer.name_or_path}."
         )
-    missing = [name for name, needle in (
-        ("response marker", RESPONSE_MARKER),
-        ("reasoning/thinking", "PREFLIGHT_THINK"),
-        ("tool name", "calc"),
-    ) if needle not in text]
+    missing = [name for name, needle in fmt_cfg["preflight_needles"]
+               if needle not in text]
     if missing:
         raise SystemExit(
             f"FATAL: chat template rendered but is missing {missing}. "
@@ -173,33 +330,49 @@ def preflight_template(tokenizer) -> None:
             f"training would not teach the behavior we collected.\n"
             f"--- rendered sample (truncated) ---\n{text[:2000]}"
         )
-    print("preflight: chat template renders reasoning + tool calls OK")
+    _, mask = tokenize_record(rec, tokenizer, fmt_cfg, resp_ids, end_ids)
+    if sum(mask) == 0:
+        raise SystemExit(
+            "FATAL: could not derive an assistant-token mask (template has no "
+            "generation blocks and the turn markers did not match). Loss would "
+            "be computed over every token. Check --chat-format / the markers.")
+    print(f"preflight: template renders reasoning + tool calls and masks "
+          f"{sum(mask)} assistant tokens OK")
 
 
-def load_samples(path: Path, tokenizer, max_seq_len: int) -> "Dataset":
-    """Render each conversation with the model's chat template into `text`."""
+def load_samples(path: Path, tokenizer, fmt_cfg: dict, max_seq_len: int,
+                 resp_ids: list[int], end_ids: list[int]) -> "Dataset":
+    """Tokenize each conversation and attach an assistant-only loss mask."""
     from datasets import Dataset
 
     rows = []
-    skipped = 0
+    skipped_render = skipped_long = skipped_nomask = 0
     first_error: str | None = None
     for line in path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
         rec = json.loads(line)
         try:
-            text = render_messages(rec, tokenizer)
+            ids, mask = tokenize_record(rec, tokenizer, fmt_cfg,
+                                        resp_ids, end_ids)
         except Exception as exc:  # noqa: BLE001 — bad sample, skip
-            skipped += 1
+            skipped_render += 1
             if first_error is None:
                 first_error = repr(exc)
             continue
-        n_tokens = len(tokenizer(text, add_special_tokens=False).input_ids)
-        if n_tokens > max_seq_len:
-            skipped += 1
+        if len(ids) > max_seq_len:
+            skipped_long += 1
             continue
-        rows.append({"text": text, "source": rec.get("source", "?")})
-    msg = f"dataset: {len(rows)} samples ({skipped} skipped) from {path}"
+        if sum(mask) == 0:
+            skipped_nomask += 1
+            continue
+        # precompute labels (standard column survives TRL/Trainer column
+        # pruning); loss is masked to assistant tokens, -100 elsewhere
+        labels = [tok if m else -100 for tok, m in zip(ids, mask)]
+        rows.append({"input_ids": ids, "labels": labels})
+    msg = (f"dataset: {len(rows)} samples from {path} "
+           f"(skipped {skipped_render} unrenderable, {skipped_long} over "
+           f"{max_seq_len} tok, {skipped_nomask} no-assistant)")
     if first_error:
         msg += f"  [first render error: {first_error}]"
     print(msg)
@@ -208,90 +381,42 @@ def load_samples(path: Path, tokenizer, max_seq_len: int) -> "Dataset":
     return Dataset.from_list(rows)
 
 
-class AssistantOnlyCollator:
-    """Pad a batch and mask loss to assistant turns only.
-
-    The Unsloth path uses ``train_on_responses_only``; the plain
-    transformers/PEFT fallback (the likely path for a brand-new arch) has no
-    equivalent, so without this it would compute loss over system/user/tool
-    tokens too — i.e. teach the model to *generate* tool outputs it should
-    only ever read. We tokenize each rendered ``text`` and unmask only the
-    spans between a response marker and the following end-of-turn token.
-    """
+class MaskedCollator:
+    """Pad a batch of pre-tokenized rows (input_ids + assistant-masked labels).
+    Labels are already -100 outside assistant turns, so loss stays on assistant
+    tokens only — the model's reasoning, tool calls, and final answer — never on
+    system/user/tool tokens. Padding extends labels with -100."""
 
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
-        self.resp_ids = tokenizer(
-            RESPONSE_MARKER, add_special_tokens=False).input_ids
-        self.end_ids = tokenizer(
-            END_OF_TURN_TOKEN, add_special_tokens=False).input_ids
-        if not self.resp_ids:
-            raise SystemExit(
-                "FATAL: response marker tokenizes to nothing; cannot mask "
-                "assistant turns in the fallback path.")
-
-    @staticmethod
-    def _find(haystack: list[int], needle: list[int], start: int) -> int:
-        if not needle:
-            return -1
-        for i in range(start, len(haystack) - len(needle) + 1):
-            if haystack[i:i + len(needle)] == needle:
-                return i
-        return -1
+        self.pad_id = (tokenizer.pad_token_id
+                       if tokenizer.pad_token_id is not None
+                       else tokenizer.eos_token_id)
 
     def __call__(self, examples: list[dict]) -> dict:
         import torch
 
-        # SFTTrainer may hand us either raw {"text": ...} rows or rows it has
-        # already tokenized into {"input_ids": [...]}, depending on the TRL
-        # version. Handle both so masking happens regardless.
-        if examples and "input_ids" in examples[0]:
-            seqs = [list(ex["input_ids"]) for ex in examples]
-            pad_id = (self.tokenizer.pad_token_id
-                      if self.tokenizer.pad_token_id is not None
-                      else self.tokenizer.eos_token_id)
-            width = max(len(s) for s in seqs)
-            right = self.tokenizer.padding_side != "left"
-            input_ids, attn = [], []
-            for s in seqs:
-                pad = [pad_id] * (width - len(s))
-                input_ids.append(s + pad if right else pad + s)
-                a = [1] * len(s)
-                amask = a + [0] * len(pad) if right else [0] * len(pad) + a
-                attn.append(amask)
-            batch = {
-                "input_ids": torch.tensor(input_ids, dtype=torch.long),
-                "attention_mask": torch.tensor(attn, dtype=torch.long),
-            }
-        else:
-            texts = [ex["text"] for ex in examples]
-            batch = self.tokenizer(
-                texts, add_special_tokens=False, padding=True,
-                return_tensors="pt",
-            )
-        labels = batch["input_ids"].clone()
-        labels[batch["attention_mask"] == 0] = -100
-        for row, ids in enumerate(batch["input_ids"].tolist()):
-            mask = [False] * len(ids)
-            pos = 0
-            while True:
-                start = self._find(ids, self.resp_ids, pos)
-                if start == -1:
-                    break
-                span_start = start + len(self.resp_ids)
-                end = self._find(ids, self.end_ids, span_start) \
-                    if self.end_ids else -1
-                # include the end-of-turn token so the model learns to stop;
-                # if no end token (truncated final turn), train to sequence end
-                span_end = (end + len(self.end_ids)) if end != -1 else len(ids)
-                for i in range(span_start, span_end):
-                    mask[i] = True
-                pos = span_end
-            for i, keep in enumerate(mask):
-                if not keep:
-                    labels[row, i] = -100
-        batch["labels"] = labels
-        return batch
+        seqs = [list(ex["input_ids"]) for ex in examples]
+        labs = [list(ex["labels"]) for ex in examples]
+        width = max(len(s) for s in seqs)
+        right = self.tokenizer.padding_side != "left"
+        input_ids, attn, labels = [], [], []
+        for s, lb in zip(seqs, labs):
+            pad = width - len(s)
+            a = [1] * len(s)
+            if right:
+                input_ids.append(s + [self.pad_id] * pad)
+                attn.append(a + [0] * pad)
+                labels.append(lb + [-100] * pad)
+            else:
+                input_ids.append([self.pad_id] * pad + s)
+                attn.append([0] * pad + a)
+                labels.append([-100] * pad + lb)
+        return {
+            "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "attention_mask": torch.tensor(attn, dtype=torch.long),
+            "labels": torch.tensor(labels, dtype=torch.long),
+        }
 
 
 def try_unsloth(args):
@@ -316,10 +441,23 @@ def try_unsloth(args):
     return model, tokenizer, True
 
 
-def fallback_hf(args):
-    """Plain transformers + bitsandbytes + PEFT path."""
+def lora_config(args):
+    from peft import LoraConfig
+    return LoraConfig(
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=0.0,
+        bias="none",
+        task_type="CAUSAL_LM",
+        target_modules=lora_targets(args.include_mlp),
+    )
+
+
+def load_4bit(args):
+    """bitsandbytes 4-bit QLoRA path (for architectures whose linears bnb can
+    quantize — NOT Laguna, whose fused experts stay bf16)."""
     import torch
-    from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+    from peft import get_peft_model, prepare_model_for_kbit_training
     from transformers import (AutoModelForCausalLM, AutoTokenizer,
                               BitsAndBytesConfig)
 
@@ -338,59 +476,211 @@ def fallback_hf(args):
         attn_implementation="sdpa",
     )
     model = prepare_model_for_kbit_training(model)
-    lora = LoraConfig(
-        r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=0.0,
-        bias="none",
-        task_type="CAUSAL_LM",
-        target_modules=lora_targets(args.include_mlp),
-    )
-    model = get_peft_model(model, lora)
+    model = get_peft_model(model, lora_config(args))
     model.print_trainable_parameters()
     return model, tokenizer, False
+
+
+def apply_liger_laguna(model) -> bool:
+    """Patch LagunaForCausalLM to compute the LM loss with Liger's fused linear
+    cross-entropy. The standard forward materializes a `[seq, vocab]` logits
+    tensor (upcast to fp32) — ~20GB at 32k context — which is the single-H100
+    bottleneck. Liger fuses the lm_head matmul + cross-entropy and chunks over
+    tokens, so the full logits tensor is never built. Laguna isn't in Liger's
+    auto-patch list, so we wire it manually. Returns True if applied."""
+    if getattr(model.config, "model_type", "") != "laguna":
+        return False
+    try:
+        from liger_kernel.transformers.model.loss_utils import (
+            LigerForCausalLMLoss, unpack_cross_entropy_result)
+        from liger_kernel.transformers.model.mixtral import (
+            LigerMoeCausalLMOutputWithPast)
+        from transformers.models.laguna import modeling_laguna as ml
+    except Exception as exc:  # noqa: BLE001
+        print(f"liger: unavailable ({exc!r}); using standard loss")
+        return False
+
+    def lce_forward(self, input_ids=None, attention_mask=None, position_ids=None,
+                    past_key_values=None, inputs_embeds=None, labels=None,
+                    use_cache=None, output_router_logits=None,
+                    logits_to_keep=0, skip_logits=None, **kwargs):
+        output_router_logits = (output_router_logits
+                                if output_router_logits is not None
+                                else self.config.output_router_logits)
+        # TRL passes these to control metrics; keep them out of the base model
+        return_token_accuracy = kwargs.pop("return_token_accuracy", False)
+        kwargs.pop("use_token_scaling", None)
+        shift_labels = kwargs.pop("shift_labels", None)
+
+        outputs = self.model(
+            input_ids=input_ids, attention_mask=attention_mask,
+            position_ids=position_ids, past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds, use_cache=use_cache,
+            output_router_logits=output_router_logits, **kwargs,
+        )
+        hidden_states = outputs.last_hidden_state
+        slice_indices = (slice(-logits_to_keep, None)
+                         if isinstance(logits_to_keep, int) else logits_to_keep)
+        kept = hidden_states[:, slice_indices, :]
+
+        logits = loss = token_accuracy = predicted_tokens = None
+        if skip_logits is None:
+            skip_logits = self.training and (
+                labels is not None or shift_labels is not None)
+        if skip_logits:
+            # fused: no [seq, vocab] logits tensor is materialized
+            result = LigerForCausalLMLoss(
+                hidden_states=kept, lm_head_weight=self.lm_head.weight,
+                labels=labels, shift_labels=shift_labels,
+                hidden_size=self.config.hidden_size,
+                return_token_accuracy=return_token_accuracy, **kwargs)
+            loss, _, token_accuracy, predicted_tokens = \
+                unpack_cross_entropy_result(result)
+        else:
+            logits = self.lm_head(kept)
+            if labels is not None or shift_labels is not None:
+                loss = self.loss_function(
+                    logits=logits, labels=labels, shift_labels=shift_labels,
+                    vocab_size=self.vocab_size, **kwargs)
+
+        aux_loss = None
+        if output_router_logits:
+            aux_loss = ml.load_balancing_loss_func(
+                outputs.router_logits, self.num_experts,
+                self.num_experts_per_tok, attention_mask)
+            if loss is not None and aux_loss is not None:
+                loss = loss + self.router_aux_loss_coef * aux_loss.to(loss.device)
+
+        return LigerMoeCausalLMOutputWithPast(
+            loss=loss, aux_loss=aux_loss, logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states, attentions=outputs.attentions,
+            router_logits=outputs.router_logits,
+            token_accuracy=token_accuracy, predicted_tokens=predicted_tokens)
+
+    ml.LagunaForCausalLM.forward = lce_forward
+    return True
+
+
+def load_lora(args):
+    """LoRA on a model loaded in its native precision (no bitsandbytes).
+
+    Used for the FP8 compressed-tensors build (experts stay FP8-compressed, the
+    attention projections we adapt stay bf16) and for plain bf16 (--quant none).
+    We adapt the attention linears only; gradient checkpointing keeps activation
+    memory in check at long context."""
+    import torch
+    from peft import get_peft_model
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(args.base)
+    # transformers reads the FP8 build's own quantization_config
+    # (compressed-tensors); a plain bf16 repo just loads in bf16.
+    model = AutoModelForCausalLM.from_pretrained(
+        args.base,
+        dtype=torch.bfloat16,
+        device_map="auto",
+        attn_implementation="sdpa",
+    )
+    model.config.use_cache = False
+    # needed so gradients reach LoRA params through a frozen/quantized base
+    # when gradient checkpointing is on
+    model.enable_input_require_grads()
+    model = get_peft_model(model, lora_config(args))
+    model.print_trainable_parameters()
+    return model, tokenizer, False
+
+
+def pull_hf_dataset(args) -> tuple[Path, Path]:
+    """Pull a HF dataset to out/sft.jsonl (+ sft-eval.jsonl). Datasets that
+    ship only a train split are deterministically split via --eval-frac."""
+    from datasets import load_dataset
+
+    print(f"Pulling dataset from HF: {args.hf_repo}...")
+    ds = load_dataset(args.hf_repo)
+    eval_key = next((k for k in ("eval", "test", "validation") if k in ds), None)
+    if eval_key:
+        train_split, eval_split = ds["train"], ds[eval_key]
+        print(f"  using existing splits: train + {eval_key}")
+    else:
+        parts = ds["train"].train_test_split(test_size=args.eval_frac, seed=0)
+        train_split, eval_split = parts["train"], parts["test"]
+        print(f"  split train into {len(train_split)}/{len(eval_split)} "
+              f"(eval_frac={args.eval_frac})")
+
+    data_path = args.out / "sft.jsonl"
+    eval_path = args.out / "sft-eval.jsonl"
+    for split, out_path in ((train_split, data_path), (eval_split, eval_path)):
+        with out_path.open("w") as f:
+            for row in split:
+                row = dict(row)
+                # some repos store tools as a JSON string; normalize to a list
+                if isinstance(row.get("tools"), str):
+                    try:
+                        row["tools"] = json.loads(row["tools"])
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                f.write(json.dumps(row) + "\n")
+        print(f"  wrote {len(split)} samples -> {out_path}")
+    return data_path, eval_path
 
 
 def main() -> None:
     args = parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
+    fmt = resolve_chat_format(args)
+    quant = resolve_quant(args)
+    fmt_cfg = CHAT_FORMATS[fmt]
+    print(f"base={args.base}  quant={quant}  chat-format={fmt}  "
+          f"max-seq-len={args.max_seq_len}")
+    if quant == "fp8" and args.include_mlp:
+        print("note: --include-mlp ignored under fp8 (expert/MLP linears are "
+              "compressed; only the bf16 attention projections are adapted)")
+        args.include_mlp = False
 
     if args.hf_repo:
-        from pathlib import Path
-        from datasets import load_dataset
-        import json
+        args.data, args.eval_data = pull_hf_dataset(args)
+    if args.data is None:
+        raise SystemExit("provide --data or --hf-repo")
 
-        print(f"Pulling dataset from HF: {args.hf_repo}...")
-        ds = load_dataset(args.hf_repo,
-                          data_files={"train": "train.jsonl", "eval": "eval.jsonl"})
-        data_path = args.out / "sft.jsonl"
-        eval_path = args.out / "sft-eval.jsonl"
-        for split, out_path in (("train", data_path), ("eval", eval_path)):
-            with out_path.open("w") as f:
-                for row in ds[split]:
-                    if row.get("tools"):
-                        row["tools"] = json.loads(row["tools"])
-                    f.write(json.dumps(row) + "\n")
-            print(f"  wrote {len(ds[split])} samples -> {out_path}")
-        args.data = data_path
-        args.eval_data = eval_path
+    if quant == "4bit":
+        try:
+            model, tokenizer, is_unsloth = try_unsloth(args)
+            print("== using Unsloth (4-bit) ==")
+        except Exception as exc:  # noqa: BLE001
+            print(f"== Unsloth unavailable ({exc!r}); "
+                  f"transformers + bitsandbytes 4-bit ==")
+            model, tokenizer, is_unsloth = load_4bit(args)
+    else:
+        model, tokenizer, is_unsloth = load_lora(args)
+        print(f"== {quant} LoRA (no bitsandbytes) ==")
+    # gradient checkpointing is set up inside the 4-bit/Unsloth paths; the
+    # native-precision LoRA path needs the trainer to enable it
+    grad_ckpt = quant in ("fp8", "none")
 
-    try:
-        model, tokenizer, is_unsloth = try_unsloth(args)
-        print("== using Unsloth ==")
-    except Exception as exc:  # noqa: BLE001
-        print(f"== Unsloth unavailable for this arch ({exc!r}); "
-              f"falling back to transformers+PEFT ==")
-        model, tokenizer, is_unsloth = fallback_hf(args)
+    liger_on = False
+    if not args.no_liger and not is_unsloth:
+        liger_on = apply_liger_laguna(model)
+        print("liger: fused linear cross-entropy enabled (frees logits VRAM)"
+              if liger_on else "liger: not applied (non-Laguna arch); standard loss")
 
-    preflight_template(tokenizer)
-    dataset = load_samples(args.data, tokenizer, args.max_seq_len)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    resp_ids = tokenizer(fmt_cfg["response_marker"],
+                         add_special_tokens=False).input_ids
+    end_ids = tokenizer(fmt_cfg["end_marker"],
+                        add_special_tokens=False).input_ids
+
+    preflight_template(tokenizer, fmt_cfg, resp_ids, end_ids)
+    dataset = load_samples(args.data, tokenizer, fmt_cfg, args.max_seq_len,
+                           resp_ids, end_ids)
     eval_dataset = None
-    if args.eval_data:
-        eval_dataset = load_samples(args.eval_data, tokenizer,
-                                    args.max_seq_len)
+    if args.eval_data and Path(args.eval_data).is_file():
+        eval_dataset = load_samples(args.eval_data, tokenizer, fmt_cfg,
+                                    args.max_seq_len, resp_ids, end_ids)
 
-    run_name = setup_wandb(args, len(dataset),
+    run_name = setup_wandb(args, fmt, len(dataset),
                            len(eval_dataset) if eval_dataset else 0)
     print(f"wandb: {'-> ' + run_name if run_name else 'off'}")
 
@@ -408,7 +698,15 @@ def main() -> None:
         save_strategy="epoch",
         bf16=True,
         max_length=args.max_seq_len,
-        dataset_text_field="text",
+        # rows are already tokenized (input_ids + masked labels); don't let TRL
+        # re-tokenize or prune our columns before the collator sees them
+        remove_unused_columns=False,
+        dataset_kwargs={"skip_prepare_dataset": True},
+        gradient_checkpointing=grad_ckpt,
+        gradient_checkpointing_kwargs={"use_reentrant": False} if grad_ckpt else None,
+        # our manual Laguna patch provides the fused loss; this flag makes TRL
+        # take the liger code paths (skip_logits, token-accuracy from output)
+        use_liger_kernel=liger_on,
         report_to="wandb" if run_name else "none",
         run_name=run_name,
         seed=0,
@@ -417,34 +715,15 @@ def main() -> None:
             "per_device_eval_batch_size": args.batch_size}
            if eval_dataset is not None else {}),
     )
-    trainer_kwargs = dict(
+    trainer = SFTTrainer(
         model=model,
         processing_class=tokenizer,
         train_dataset=dataset,
         eval_dataset=eval_dataset,
         args=config,
+        data_collator=MaskedCollator(tokenizer),
     )
-    # In the fallback path, mask loss to assistant turns ourselves (Unsloth
-    # gets this from train_on_responses_only below). Without a collator SFT
-    # would train on tool outputs / user / system tokens too.
-    if not is_unsloth:
-        trainer_kwargs["data_collator"] = AssistantOnlyCollator(tokenizer)
-        print("loss masked to assistant turns (fallback collator)")
-    trainer = SFTTrainer(**trainer_kwargs)
-
-    if is_unsloth:
-        # only compute loss on assistant turns
-        try:
-            from unsloth.chat_templates import train_on_responses_only
-            trainer = train_on_responses_only(
-                trainer,
-                instruction_part=INSTRUCTION_MARKER,
-                response_part=RESPONSE_MARKER,
-            )
-            print("loss masked to assistant turns")
-        except Exception as exc:  # noqa: BLE001
-            print(f"train_on_responses_only unavailable ({exc!r}); "
-                  f"training on full sequences")
+    print("loss masked to assistant turns (assistant-token mask)")
 
     trainer.train()
 
@@ -454,6 +733,15 @@ def main() -> None:
     print(f"adapter saved -> {adapter_dir}")
 
     if args.no_merge:
+        return
+
+    if quant == "fp8":
+        print("skip merge: a LoRA adapter trained on the FP8 "
+              "(compressed-tensors) base can't be merge_and_unload'd here "
+              "(quantized weights + Hadamard transforms). Serve the adapter on "
+              "top of the FP8 base with vLLM (`--enable-lora`), or merge "
+              "offline with llmcompressor. Adapter is at "
+              f"{args.out / 'adapter'}.")
         return
 
     merged_dir = args.out / "merged"

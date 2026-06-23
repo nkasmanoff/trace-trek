@@ -14,8 +14,15 @@
     "extra": []
   },
   {
-    "label": "laguna-xs.2",
+    "label": "laguna-base",
     "model": "frontier/poolside/laguna-xs.2",
+    "agent": null,
+    "no_synth": false,
+    "extra": []
+  },
+  {
+    "label": "laguna-sft",
+    "model": "llamacpp/laguna-xs.2",
     "agent": null,
     "no_synth": false,
     "extra": []

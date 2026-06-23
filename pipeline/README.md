@@ -1,84 +1,110 @@
 # Pipeline
 
 Training and evaluation pipeline for the trace-trek self-improvement loop.
+The default target model is **`poolside/Laguna-XS.2`** (33B-total / 3B-active
+MoE), fine-tuned with QLoRA on the **`nkasmanoff/opencode-sft`** dataset.
 
 ## Data flow
 
 ```
-opencode sessions
-       │  (stored in opencode SQLite DB)
-       ▼
-viewer/                   # dev server reads DB, converts to SFT
-  └── SFT export ──> HuggingFace dataset     ←── primary path
-                          │
-                    ┌─────┘
-                    ▼
-              train/train.py --hf-repo <name>    (cloud GPU, QLoRA)
+nkasmanoff/opencode-sft (HF, single train split)
                     │
                     ▼
-              deploy/deploy.sh                    (GGUF convert + serve)
+   train/pull_dataset.py   ──>  dataset/sft.jsonl  +  dataset/sft-eval.jsonl
+                    │                                        │
+                    │                          eval/harvest_eval_tasks.py
+                    │                                        │
+                    │                                        ▼
+                    │                               eval/eval-tasks.jsonl
+                    │                                        │
+                    │                          ┌─────────────┘
+                    │                          ▼
+                    │             eval/run_baseline.py  ← BASELINE on base Laguna
+                    │             (opencode harness, before training)
+                    ▼
+        train/train.py    (cloud GPU, QLoRA, assistant-only loss)
                     │
                     ▼
-              eval/run_evals.py                   (gate: keep or roll back)
+        deploy/deploy.sh                 (GGUF convert + serve)
+                    │
+                    ▼
+   eval/run_baseline.py EVAL_MODEL=<deployed>   ← re-score, measure the lift
+   eval/run_evals.py                            (tool/chat/opencode gate)
 ```
 
-The legacy proxy-based data flow (`collect/proxy.py`) is deprecated. Traces are
-now collected from opencode's built-in SQLite session DB via the viewer app
-(`../viewer/` — run `npm run dev`), which can export sessions in SFT format
-and upload them directly to a HuggingFace dataset repo.
+The dataset (`nkasmanoff/opencode-sft`) is real opencode sessions: a user
+request plus the assistant's ground-truth trajectory (reasoning + tool calls +
+answer). `pull_dataset.py` holds out `--eval-frac` (default 10%) for evaluation,
+and `harvest_eval_tasks.py` turns exactly those held-out rows into eval tasks —
+so nothing is both trained on and evaluated.
+
+The legacy proxy-based data flow (`collect/proxy.py`) is deprecated.
 
 ## Quick start
 
-### 1. Collect traces
+Recommended order — **evaluate the base model first**, then train, then
+re-evaluate to measure the lift.
+
+### 1. Split the dataset
 
 ```bash
-cd ../viewer
-npm run dev
+cd pipeline
+make split        # pull nkasmanoff/opencode-sft -> dataset/sft.jsonl + sft-eval.jsonl
 ```
 
-Open the viewer, connect to opencode's DB, and use the SFT export or
-**Upload to HF** feature. This is the primary data collection path.
-
-### 2. Pull dataset and train
+### 2. Harvest eval tasks + baseline the base model
 
 ```bash
-cd ../pipeline
+make harvest                          # held-out eval split -> eval/eval-tasks.jsonl
 
-# Pull dataset from HF and train
-python3 train/train.py --hf-repo nkasmanoff/local-code-sft-json --out outputs
-
-# Or pull and train via Makefile
-make train
+# Serve base Laguna so opencode can reach it, e.g.:
+#   python inference/laguna_mlx.py            (local, Apple Silicon)
+#   modal deploy inference/laguna_modal.py    (cloud, H100 + vLLM)
+make eval-baseline                    # opencode-harness score on base Laguna
 ```
 
-See `train/train.py --help` for training options (base model, LoRA rank,
-learning rate, etc.).
+### 3. Train
 
-### 3. Deploy
+```bash
+make train        # QLoRA fine-tune Laguna on dataset/sft.jsonl (cloud GPU)
+```
+
+On a GPU pod you can pull + train in one shot instead:
+
+```bash
+python3 train/train.py --hf-repo nkasmanoff/opencode-sft --out outputs
+```
+
+See `train/train.py --help` and `train/README.md` for options (LoRA rank,
+learning rate, `--max-seq-len`, `--include-mlp`, etc.).
+
+### 4. Deploy
 
 ```bash
 ./deploy/deploy.sh /path/to/merged-checkpoint v2
 ./deploy/deploy.sh --serve-only v1   # rollback
 ```
 
-### 4. Evaluate
+### 5. Re-evaluate (measure the lift)
 
 ```bash
-make eval              # tool-call validity + chat sanity gate
-make eval-tasks        # held-out task pass rate
-make eval-set          # agent comparison (eval tab in viewer)
+# Re-score the SAME harvested tasks against the deployed checkpoint
+make eval-baseline EVAL_MODEL=llamacpp/laguna-xs.2
+
+make eval              # tool-call validity + chat sanity + opencode gate
+make eval-set          # base vs. fine-tuned agent comparison (eval/agents.json)
 ```
 
-## Tasks
+## Git-backed held-out tasks (optional)
 
-Generate held-out evaluation tasks:
+`run_baseline.py` grades open-ended requests by reference-entity coverage. For
+verifiable, repo-backed tasks (file-overlap / knowledge grading in an isolated
+git worktree), generate them separately:
 
 ```bash
-python3 collect/make_tasks.py
-make split             # -> dataset/tasks-train.jsonl + dataset/tasks-test.jsonl
+python3 collect/make_tasks.py        # -> dataset/tasks-test.jsonl
+make eval-tasks                      # replay them on the served model
 ```
-
-The test split is excluded from training data and used only for evaluation.
 
 ## Dataset quality gate
 

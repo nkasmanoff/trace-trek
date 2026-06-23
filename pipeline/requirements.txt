@@ -1,20 +1,27 @@
-# Training dependencies for QLoRA fine-tuning a local code model on a CUDA GPU.
+# Training dependencies for LoRA fine-tuning Laguna-XS.2 on a CUDA GPU.
 # Install on the pod (PyTorch 2.x / CUDA 12 image; torch is preinstalled there).
 #
 #   pip install -r requirements.txt
 #
-# cohere2_moe is a brand-new architecture and REQUIRES transformers >= 5.8.0.
-# If that release isn't out yet, install transformers from source instead:
-#   pip install git+https://github.com/huggingface/transformers.git
+# Laguna-XS.2 requires transformers >= 5.7.0. The default base is the FP8
+# (compressed-tensors) build, which fits LoRA on one 80GB H100 — see train.py
+# for why plain bitsandbytes QLoRA does not work for this MoE.
 
-transformers>=5.8.0
+transformers>=5.7.0
 trl
 peft
 datasets
 accelerate
+
+# FP8 (compressed-tensors) base loading — required for --quant fp8 (the default).
+compressed-tensors>=0.14
+
+# Only needed for --quant 4bit (bitsandbytes QLoRA on quantizable architectures;
+# NOT effective for Laguna's fused MoE experts).
 bitsandbytes
+
 wandb
 
-# Optional but preferred (fastest, lowest VRAM). train.py falls back to
-# transformers + PEFT if Unsloth can't load the cohere2_moe architecture.
+# Optional; only used by the --quant 4bit path. train.py falls back to
+# transformers + PEFT if Unsloth can't load the architecture.
 unsloth
