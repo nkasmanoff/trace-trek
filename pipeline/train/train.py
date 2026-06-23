@@ -130,7 +130,53 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--run-name", default=None,
                    help="W&B run name (default: auto from data + params)")
     p.add_argument("--no-wandb", action="store_true")
+    p.add_argument("--max-samples", type=int, default=0,
+                   help="cap train samples (0 = all); for quick smoke tests")
+    # Intermittent eval gate: stand up an in-process OpenAI server backed by the
+    # live (in-training) weights and run eval/run_evals.py against it, logging
+    # the section pass rates to W&B. See train/eval_server.py.
+    p.add_argument("--eval-gate", action="store_true",
+                   help="run eval/run_evals.py periodically during training "
+                        "against the in-training model, logging to W&B")
+    p.add_argument("--eval-gate-steps", type=int, default=20,
+                   help="run the eval gate every N optimizer steps (0 = off)")
+    p.add_argument("--eval-gate-epochs", type=int, default=0,
+                   help="run the eval gate every N epochs (0 = off); set with "
+                        "--eval-gate-steps 0 for an epoch-only cadence")
+    p.add_argument("--eval-gate-at-start", action="store_true", default=True,
+                   help="also run the gate once before training (step 0)")
+    p.add_argument("--no-eval-gate-at-start", dest="eval_gate_at_start",
+                   action="store_false")
+    p.add_argument("--eval-gate-port", type=int, default=8848)
+    p.add_argument("--eval-gate-max-new-tokens", type=int, default=2048)
+    p.add_argument("--eval-gate-opencode", action="store_true",
+                   help="include the (slow, streaming) opencode-tasks section; "
+                        "off by default — tool-validity + chat-sanity only")
+    p.add_argument("--push-to-hub", default=None, metavar="REPO_ID",
+                   help="after training, upload the LoRA adapter "
+                        "(outputs/adapter/) to this HF repo, e.g. "
+                        "user/laguna-opencode-lora. Uses HF_TOKEN.")
+    p.add_argument("--push-merged", action="store_true",
+                   help="also upload the merged bf16 checkpoint to "
+                        "<repo>-merged (large; non-fp8 paths only)")
+    p.add_argument("--hub-private", action="store_true",
+                   help="create the pushed HF repo(s) as private")
     return p.parse_args()
+
+
+def load_dotenv(start: Path) -> None:
+    import os
+    for d in [start, *start.parents]:
+        env = d / ".env"
+        if env.is_file():
+            for line in env.read_text().splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip())
+            print(f"loaded env from {env}")
+            return
 
 
 def resolve_quant(args) -> str:
@@ -625,8 +671,170 @@ def pull_hf_dataset(args) -> tuple[Path, Path]:
     return data_path, eval_path
 
 
+def _write_opencode_config(out_dir: Path, base_url: str, model_id: str) -> Path:
+    """Write an opencode.json that points opencode at the in-process server, so
+    the opencode-tasks section of run_evals.py routes to the in-training model.
+    Returns the directory to run opencode from (its $PWD picks up the config)."""
+    cfg = {
+        "$schema": "https://opencode.ai/config.json",
+        "provider": {
+            "local": {
+                "npm": "@ai-sdk/openai-compatible",
+                "name": "Local (in-training)",
+                "options": {"baseURL": base_url},
+                "models": {model_id: {"name": model_id}},
+            }
+        },
+    }
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "opencode.json").write_text(json.dumps(cfg, indent=2))
+    return out_dir
+
+
+class IntermittentEvalCallback:
+    """TrainerCallback that runs eval/run_evals.py against an in-process server
+    backed by the live model, at training start, every N steps, and at the end,
+    logging section pass rates to W&B. Imported lazily as a TrainerCallback
+    subclass inside main() (so transformers stays an optional import here)."""
+
+    def __init__(self, args, eval_dir: Path):
+        self.cb_args = args
+        self.eval_dir = eval_dir
+        self.server = None
+        self._last_step = -1
+        self._epoch = 0
+
+    # --- lifecycle hooks (names match transformers.TrainerCallback) ---
+    def on_train_begin(self, args, state, control, **kw):
+        if self.cb_args.eval_gate_at_start:
+            self._run(state, kw, when="start")
+
+    def on_step_end(self, args, state, control, **kw):
+        n = self.cb_args.eval_gate_steps
+        if n > 0 and state.global_step > 0 and state.global_step % n == 0:
+            self._run(state, kw, when="step")
+
+    def on_epoch_end(self, args, state, control, **kw):
+        n = self.cb_args.eval_gate_epochs
+        if n <= 0:
+            return
+        self._epoch += 1
+        if self._epoch % n == 0:
+            self._run(state, kw, when=f"epoch{self._epoch}")
+
+    def on_train_end(self, args, state, control, **kw):
+        self._run(state, kw, when="end")
+        if self.server is not None:
+            self.server.stop()
+
+    # --- helpers ---
+    def _ensure_server(self, model, tokenizer):
+        if self.server is None:
+            from eval_server import InProcessModelServer
+            self.server = InProcessModelServer(
+                model, tokenizer, port=self.cb_args.eval_gate_port,
+                max_new_tokens=self.cb_args.eval_gate_max_new_tokens)
+            url = self.server.start()
+            print(f"[eval-gate] in-process server up at {url}")
+        return self.server
+
+    def _run(self, state, kw, when: str):
+        import os
+        import subprocess
+        import sys
+        step = state.global_step
+        if step == self._last_step:
+            return
+        self._last_step = step
+        model = kw.get("model")
+        tokenizer = kw.get("processing_class") or kw.get("tokenizer")
+        if model is None or tokenizer is None:
+            print("[eval-gate] no model/tokenizer in callback; skipping")
+            return
+
+        was_training = model.training
+        prev_cache = getattr(model.config, "use_cache", False)
+        model.eval()
+        model.config.use_cache = True
+        try:
+            server = self._ensure_server(model, tokenizer)
+            run_evals = Path(__file__).resolve().parent.parent / "eval" / "run_evals.py"
+            cmd = [sys.executable, str(run_evals),
+                   "--base-url", server.base_url]
+            env = dict(os.environ)
+            if self.cb_args.eval_gate_opencode:
+                workdir = _write_opencode_config(
+                    self.cb_args.out / "opencode-eval", server.base_url,
+                    "local-code-model")
+                cmd += ["--model", "local/local-code-model"]
+                env["PATH"] = os.path.expanduser("~/.opencode/bin") + os.pathsep + env.get("PATH", "")
+                cwd = str(workdir)
+            else:
+                cmd.append("--skip-opencode")
+                cwd = None
+
+            before = {p.name for p in self.eval_dir.glob("results-*.json")}
+            print(f"[eval-gate] step {step} ({when}): {' '.join(cmd)}")
+            subprocess.run(cmd, env=env, cwd=cwd, check=False)
+            new = sorted(p for p in self.eval_dir.glob("results-*.json")
+                         if p.name not in before)
+            if not new:
+                print("[eval-gate] no results file produced")
+                return
+            results = json.loads(new[-1].read_text())
+            self._log(results, step, when)
+        except Exception as exc:  # noqa: BLE001 — never let eval kill training
+            print(f"[eval-gate] FAILED at step {step}: {exc!r}")
+        finally:
+            model.config.use_cache = prev_cache
+            if was_training:
+                model.train()
+
+    def _log(self, results: dict, step: int, when: str):
+        try:
+            import wandb
+        except Exception:  # noqa: BLE001
+            return
+        if wandb.run is None:
+            return
+        metrics = {}
+        for section in ("tool_validity", "chat_sanity", "opencode_tasks"):
+            sec = results.get(section) or {}
+            passed, total = sec.get("passed", 0), sec.get("total", 0)
+            metrics[f"eval_gate/{section}_passed"] = passed
+            metrics[f"eval_gate/{section}_total"] = total
+            if total:
+                metrics[f"eval_gate/{section}_rate"] = passed / total
+        wandb.log(metrics, step=step)
+        summary = "  ".join(f"{k.split('/')[-1]}={v}" for k, v in metrics.items()
+                            if k.endswith("_rate"))
+        print(f"[eval-gate] step {step} ({when}) -> {summary or 'logged'}")
+
+
+def push_folder_to_hub(local_dir: Path, repo_id: str, private: bool) -> str | None:
+    """Upload a local folder to an HF model repo (creating it if needed).
+    Returns the repo URL, or None on failure (never fatal — the local
+    checkpoint is already on disk)."""
+    import os
+    try:
+        from huggingface_hub import HfApi
+        api = HfApi(token=os.environ.get("HF_TOKEN"))
+        api.create_repo(repo_id, repo_type="model", private=private,
+                        exist_ok=True)
+        api.upload_folder(folder_path=str(local_dir), repo_id=repo_id,
+                          repo_type="model")
+        url = f"https://huggingface.co/{repo_id}"
+        print(f"pushed {local_dir} -> {url}")
+        return url
+    except Exception as exc:  # noqa: BLE001
+        print(f"push-to-hub FAILED for {repo_id}: {exc!r} "
+              f"(local copy is at {local_dir})")
+        return None
+
+
 def main() -> None:
     args = parse_args()
+    load_dotenv(Path(__file__).resolve().parent)
     args.out.mkdir(parents=True, exist_ok=True)
     fmt = resolve_chat_format(args)
     quant = resolve_quant(args)
@@ -675,6 +883,10 @@ def main() -> None:
     preflight_template(tokenizer, fmt_cfg, resp_ids, end_ids)
     dataset = load_samples(args.data, tokenizer, fmt_cfg, args.max_seq_len,
                            resp_ids, end_ids)
+    if args.max_samples and len(dataset) > args.max_samples:
+        dataset = dataset.select(range(args.max_samples))
+        print(f"smoke: capped train set to {len(dataset)} samples "
+              f"(--max-samples {args.max_samples})")
     eval_dataset = None
     if args.eval_data and Path(args.eval_data).is_file():
         eval_dataset = load_samples(args.eval_data, tokenizer, fmt_cfg,
@@ -715,6 +927,26 @@ def main() -> None:
             "per_device_eval_batch_size": args.batch_size}
            if eval_dataset is not None else {}),
     )
+    callbacks = []
+    if args.eval_gate:
+        from transformers import TrainerCallback
+
+        class _EvalGateCallback(IntermittentEvalCallback, TrainerCallback):
+            pass
+
+        eval_dir = Path(__file__).resolve().parent.parent / "eval"
+        callbacks.append(_EvalGateCallback(args, eval_dir))
+        cadence = []
+        if args.eval_gate_steps > 0:
+            cadence.append(f"every {args.eval_gate_steps} steps")
+        if args.eval_gate_epochs > 0:
+            cadence.append(f"every {args.eval_gate_epochs} epoch(s)")
+        if args.eval_gate_at_start:
+            cadence.append("at start")
+        cadence.append("at end")
+        print(f"eval-gate: on ({', '.join(cadence)}, "
+              f"opencode={'on' if args.eval_gate_opencode else 'off'})")
+
     trainer = SFTTrainer(
         model=model,
         processing_class=tokenizer,
@@ -722,6 +954,7 @@ def main() -> None:
         eval_dataset=eval_dataset,
         args=config,
         data_collator=MaskedCollator(tokenizer),
+        callbacks=callbacks or None,
     )
     print("loss masked to assistant turns (assistant-token mask)")
 
@@ -731,6 +964,9 @@ def main() -> None:
     model.save_pretrained(str(adapter_dir))
     tokenizer.save_pretrained(str(adapter_dir))
     print(f"adapter saved -> {adapter_dir}")
+
+    if args.push_to_hub:
+        push_folder_to_hub(adapter_dir, args.push_to_hub, args.hub_private)
 
     if args.no_merge:
         return
@@ -764,6 +1000,10 @@ def main() -> None:
         merged.save_pretrained(str(merged_dir), safe_serialization=True)
         tokenizer.save_pretrained(str(merged_dir))
     print(f"merged checkpoint -> {merged_dir}")
+
+    if args.push_to_hub and args.push_merged:
+        push_folder_to_hub(merged_dir, args.push_to_hub + "-merged",
+                           args.hub_private)
 
     if run_name:
         import wandb

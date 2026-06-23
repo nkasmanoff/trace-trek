@@ -21,6 +21,22 @@ experts just run the forward pass. `--quant` selects the strategy:
 
 `--include-mlp` is ignored under fp8 (those linears are compressed).
 
+> **Known incompatibility (transformers 5.12.x + torch 2.12.x):** the FP8 path
+> currently fails in the MoE forward. `transformers/integrations/moe.py` casts
+> the expert inputs to the experts' FP8 dtype and calls `torch._grouped_mm`,
+> which only accepts fp32/bf16/fp16 — so both training *and* generation raise
+> `RuntimeError: Expected mat_a to be ... got Float8_e4m3fn`. Until this is fixed
+> upstream, run the **bf16 base across two GPUs** instead:
+>
+> ```bash
+> python train/train.py --base poolside/Laguna-XS.2 --quant none ...
+> ```
+>
+> bf16 weights (~67GB) shard across 2×80GB H100 via `device_map="auto"` (naive
+> model parallelism), and `_grouped_mm(bf16, bf16)` works. This is also the
+> natural "use both GPUs" layout. Re-enable `--quant fp8` once the upstream
+> grouped-mm path handles FP8 experts.
+
 ## Chat template + loss masking
 
 Laguna's chat template marks assistant spans with Jinja `{% generation %}`
@@ -87,6 +103,54 @@ What to watch in W&B:
 - `train/loss` should drop fast in epoch 1, then flatten
 - `eval/loss` is the overfit signal — stop when it turns upward
   (with a few hundred samples expect the turn during epoch 2-3)
+
+## Intermittent behavioral eval during training (`--eval-gate`)
+
+`eval/loss` only measures next-token likelihood. To also track *behavioral*
+quality (does the model still emit valid tool calls and clean chat answers?)
+while training, pass `--eval-gate`: at training start, every N steps, and at the
+end, `train.py` runs `eval/run_evals.py` against the **live in-training model**
+and logs the section pass rates to W&B under `eval_gate/*`.
+
+How it works (see `train/eval_server.py`): there's no second GPU and no vLLM, so
+`train.py` exposes the in-memory weights via a tiny OpenAI-compatible server
+(`/v1/chat/completions`) inside the training process. It reproduces what vLLM's
+`poolside_v1` parser does at deploy time — converting Laguna's native
+`<think>…</think>` + `<tool_call>name<arg_key>…</arg_key><arg_value>…</arg_value>
+</tool_call>` text into OpenAI `reasoning_content` + `tool_calls` — so the
+unmodified `run_evals.py` can score it. Training pauses for each gate
+(`model.eval()`), then resumes.
+
+```bash
+python train/train.py --base poolside/Laguna-XS.2 --quant none \
+    --data dataset/sft.jsonl --eval-data dataset/sft-eval.jsonl --out outputs \
+    --eval-gate --eval-gate-steps 20
+```
+
+Flags: `--eval-gate-steps N` (cadence), `--no-eval-gate-at-start` (skip the
+step-0 baseline), `--eval-gate-max-new-tokens` (per-prompt generation budget),
+`--eval-gate-port`, and `--eval-gate-opencode` (also run the slow opencode-tasks
+section — off by default; needs `opencode` on PATH, see below). `--max-samples N`
+caps the train set for quick smoke tests.
+
+In W&B you get `eval_gate/tool_validity_rate`, `eval_gate/chat_sanity_rate`
+(and `eval_gate/opencode_tasks_rate` if enabled) alongside `train/loss` and
+`eval/loss`. Note: gates run generation on the full model, so each one adds a
+few minutes — keep N modest on long runs.
+
+### opencode (for the opencode-tasks section / `make eval*`)
+
+`run_evals.py`'s opencode section and the `eval/run_baseline.py` harness shell
+out to `opencode`. Install it once on the pod:
+
+```bash
+curl -fsSL https://opencode.ai/install | bash   # installs to ~/.opencode/bin
+# (npm i -g opencode-ai also works on some setups)
+```
+
+With `--eval-gate-opencode`, `train.py` writes an `opencode.json` under
+`<out>/opencode-eval/` that registers a `local` provider pointing at the
+in-process server, and runs `opencode run -m local/local-code-model`.
 
 ### Deploy (FP8 path)
 

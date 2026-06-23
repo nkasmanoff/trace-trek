@@ -13,6 +13,12 @@ peft
 datasets
 accelerate
 
+# Fused linear cross-entropy for the FP8 LoRA path. train.py patches Laguna's
+# forward to use Liger so the [seq, vocab] logits tensor (~20GB at 32k ctx) is
+# never materialized — the main thing that lets long context fit in VRAM.
+# Optional: train.py falls back to the standard loss if it can't be imported.
+liger-kernel
+
 # FP8 (compressed-tensors) base loading — required for --quant fp8 (the default).
 compressed-tensors>=0.14
 
