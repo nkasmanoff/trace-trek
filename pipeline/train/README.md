@@ -1,58 +1,54 @@
 # Training on a rented GPU
 
-LoRA on `poolside/Laguna-XS.2-FP8` (33B-total / 3B-active MoE). One 80GB H100
-fits it. Expect 1-3 hours for a few hundred samples (~$5-10 on RunPod at
-~$2-3/hr).
+LoRA on `Qwen/Qwen3.6-35B-A3B` (35B-total / 3B-active hybrid MoE). bf16 LoRA
+fits one 80GB H100 (~74GB at modest context). Expect 1-3 hours for a few hundred
+samples (~$5-10 on RunPod at ~$2-3/hr).
 
-## Why FP8, not bitsandbytes QLoRA
+## Why bf16 LoRA, not bitsandbytes QLoRA
 
-94% of Laguna's params live in a fused `LagunaExperts` module (256 experts), not
-in `nn.Linear` layers. bitsandbytes 4-bit only swaps `nn.Linear`, so it leaves
-the experts in bf16 and the model loads at ~77GB — it OOMs on an 80GB H100.
+4-bit QLoRA is **discouraged** for the Qwen MoE family: bitsandbytes introduces
+large quantization error on these experts (instability / quality loss), and the
+fused experts don't quantize cleanly anyway. Since bf16 LoRA already fits one
+80GB H100 (~74GB), the default is bf16. `--quant` selects the strategy:
 
-So the default base is the **FP8 (compressed-tensors) build**: the MoE experts
-ship FP8-compressed (~36GB total) while the attention projections stay bf16.
-LoRA adapts those bf16 attention linears (`q/k/v/o_proj`); the frozen FP8
-experts just run the forward pass. `--quant` selects the strategy:
-
+- `none` (default for Qwen) — plain bf16 LoRA. Fits one H100; shards across
+  multiple GPUs via `device_map="auto"` if present.
 - `fp8` (default for `*-FP8` repos) — native compressed-tensors load, no bnb.
-- `4bit` — bitsandbytes QLoRA (only for architectures bnb can actually quantize).
-- `none` — plain bf16 (needs ~70GB+ just for weights; use multiple GPUs / H200).
+- `4bit` — bitsandbytes QLoRA. Discouraged for Qwen MoE; kept for legacy paths.
 
-`--include-mlp` is ignored under fp8 (those linears are compressed).
+### Critical: LoRA targets on the hybrid architecture
 
-> **Known incompatibility (transformers 5.12.x + torch 2.12.x):** the FP8 path
-> currently fails in the MoE forward. `transformers/integrations/moe.py` casts
-> the expert inputs to the experts' FP8 dtype and calls `torch._grouped_mm`,
-> which only accepts fp32/bf16/fp16 — so both training *and* generation raise
-> `RuntimeError: Expected mat_a to be ... got Float8_e4m3fn`. Until this is fixed
-> upstream, run the **bf16 base across two GPUs** instead:
->
-> ```bash
-> python train/train.py --base poolside/Laguna-XS.2 --quant none ...
-> ```
->
-> bf16 weights (~67GB) shard across 2×80GB H100 via `device_map="auto"` (naive
-> model parallelism), and `_grouped_mm(bf16, bf16)` works. This is also the
-> natural "use both GPUs" layout. Re-enable `--quant fp8` once the upstream
-> grouped-mm path handles FP8 experts.
+Qwen3.6 is a hybrid: ~30 **Gated DeltaNet** (linear-attention) layers + ~10
+standard attention layers + a 256-expert MoE. The usual `q/k/v/o_proj` targets
+only reach the 10 standard attention layers (~0.02% of params) and **training
+NaNs**. `train.py` therefore also adapts the DeltaNet projections
+(`in_proj_qkv` / `in_proj_z` / `out_proj`) for the `qwen` chat format. Pass
+`--include-mlp` to additionally adapt the MoE expert FFNs (`switch_mlp`).
+
+### Loading
+
+Qwen3.6 is a multimodal (image-text-to-text) checkpoint; we train the text path
+only. `train.py` prefers **Unsloth** as the loader (it handles the text-only
+path, the MoE kernels, gradient checkpointing, and the DeltaNet targets) and
+falls back to transformers + PEFT.
 
 ## Chat template + loss masking
 
-Laguna's chat template marks assistant spans with Jinja `{% generation %}`
-blocks, so `train.py` gets an exact assistant-token mask straight from
-`apply_chat_template(..., return_assistant_tokens_mask=True)` and masks the loss
-to assistant turns only (reasoning + tool calls + answer). No string-marker
-matching. For chat formats whose template lacks generation blocks (e.g. Cohere,
-`--chat-format cohere`), it falls back to masking between configured turn
-markers. On startup `train.py` runs a chat-template preflight and aborts if
-reasoning, tool calls, or the assistant mask don't render — a silent drop there
-would mean training on nothing useful.
+Qwen's chat template has **no** `{% generation %}` blocks, so `train.py` derives
+the assistant-token mask from turn markers instead: it masks the span between
+`<|im_start|>assistant\n` and the following `<|im_end|>` (reasoning + tool calls
++ answer). The `qwen` format sets `preserve_thinking=True` so reasoning from
+*historical* assistant turns is rendered (and trained on), not just the last
+turn. Templates that *do* expose generation blocks (e.g. Laguna,
+`--chat-format laguna`) get an exact mask from
+`apply_chat_template(..., return_assistant_tokens_mask=True)`. On startup
+`train.py` runs a chat-template preflight and aborts if reasoning, tool calls,
+or the assistant mask don't render — a silent drop there would mean training on
+nothing useful.
 
-Laguna XS.2 is supported in `transformers >= 5.7.0`.
-
-The `opencode-sft` dataset stores tool-call arguments as JSON strings; the
-Laguna template needs dicts, so `train.py` parses them back automatically.
+The `opencode-sft` dataset stores tool-call arguments as JSON strings; the Qwen
+template iterates `arguments.items()` (needs dicts), so `train.py` parses them
+back automatically.
 
 ## Sequence length
 
@@ -65,13 +61,13 @@ samples above the cap are skipped (reported at load time).
 
 ```bash
 pip install -U -r requirements.txt
-# or minimally for the fp8 path:
-pip install -U "transformers>=5.7.0" trl peft datasets accelerate \
-    "compressed-tensors>=0.14" wandb
+# or minimally for the default Qwen bf16 path:
+pip install -U "transformers>=5.7.0" trl peft datasets accelerate unsloth wandb
 ```
 
-`compressed-tensors` is required to load the FP8 base. (If `import transformers`
-pulls in a broken `torchvision`, `pip uninstall torchvision` — it's unused here.)
+`compressed-tensors>=0.14` is only required for an FP8 base. (If `import
+transformers` pulls in a broken `torchvision`, reinstall a matching torchvision —
+the Qwen processor imports it.)
 
 ## Run a cycle
 
@@ -81,7 +77,7 @@ Pull + split the dataset, then train:
 cd pipeline
 make split                       # dataset/sft.jsonl + dataset/sft-eval.jsonl
 export WANDB_API_KEY=...          # enables W&B logging (omit to disable)
-make train                        # QLoRA on Laguna
+make train                        # bf16 LoRA on Qwen3.6
 ```
 
 Or directly (e.g. on a fresh pod, pulling straight from HF):
@@ -93,7 +89,7 @@ python train/train.py --hf-repo nkasmanoff/opencode-sft --out outputs \
 # lower the context if you OOM: --max-seq-len 32768
 ```
 
-W&B logs to project `laguna-sft` (override with `--wandb-project`,
+W&B logs to project `qwen-sft` (override with `--wandb-project`,
 `--run-name`; force off with `--no-wandb`). Train/eval loss, LR schedule,
 and the full hyperparameter config are tracked per run; eval loss is
 computed every 20 steps (`--eval-steps`).
@@ -114,15 +110,16 @@ and logs the section pass rates to W&B under `eval_gate/*`.
 
 How it works (see `train/eval_server.py`): there's no second GPU and no vLLM, so
 `train.py` exposes the in-memory weights via a tiny OpenAI-compatible server
-(`/v1/chat/completions`) inside the training process. It reproduces what vLLM's
-`poolside_v1` parser does at deploy time — converting Laguna's native
-`<think>…</think>` + `<tool_call>name<arg_key>…</arg_key><arg_value>…</arg_value>
-</tool_call>` text into OpenAI `reasoning_content` + `tool_calls` — so the
-unmodified `run_evals.py` can score it. Training pauses for each gate
+(`/v1/chat/completions`) inside the training process. It reproduces what the
+matching vLLM tool-call parser does at deploy time — converting the model's
+native `<think>…</think>` + tool-call text into OpenAI `reasoning_content` +
+`tool_calls` — so the unmodified `run_evals.py` can score it. The parser is
+chosen by chat format (Qwen's `qwen3_coder` `<function=…><parameter=…>` XML, or
+Laguna's `<arg_key>/<arg_value>`). Training pauses for each gate
 (`model.eval()`), then resumes.
 
 ```bash
-python train/train.py --base poolside/Laguna-XS.2 --quant none \
+python train/train.py \
     --data dataset/sft.jsonl --eval-data dataset/sft-eval.jsonl --out outputs \
     --eval-gate --eval-gate-steps 20
 ```
@@ -152,20 +149,22 @@ With `--eval-gate-opencode`, `train.py` writes an `opencode.json` under
 `<out>/opencode-eval/` that registers a `local` provider pointing at the
 in-process server, and runs `opencode run -m local/local-code-model`.
 
-### Deploy (FP8 path)
+### Deploy
 
-There is no bf16 merge under `--quant fp8` (the base is compressed and
-Hadamard-transformed). Training writes just the LoRA adapter to
-`outputs/adapter/` (tens of MB). Serve it on top of the FP8 base with vLLM:
+For the default `none` (bf16) path, `train.py` writes a merged bf16 checkpoint
+to `outputs/merged/` (via Unsloth's `save_pretrained_merged`) for GGUF
+conversion via `deploy/deploy.sh`, plus the adapter to `outputs/adapter/`. Serve
+the adapter on the Qwen base with vLLM (`--enable-lora`), or the merged
+checkpoint directly.
+
+There is no bf16 merge under `--quant fp8` (the base is compressed). Training
+then writes just the LoRA adapter to `outputs/adapter/` (tens of MB); serve it
+on top of the FP8 base with vLLM `--enable-lora`:
 
 ```bash
 rsync -avz <pod>:/workspace/outputs/adapter/ ./adapters/v2/
-# serve poolside/Laguna-XS.2-FP8 with --enable-lora and register ./adapters/v2
-# (see inference/laguna_modal.py — add --enable-lora / --lora-modules)
+# serve Qwen/Qwen3.6-35B-A3B with --enable-lora and register ./adapters/v2
 ```
-
-For the `4bit` / `none` paths, `train.py` instead writes a merged bf16
-checkpoint to `outputs/merged/` for GGUF conversion via `deploy/deploy.sh`.
 
 ## Tips
 

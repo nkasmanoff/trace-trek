@@ -19,10 +19,10 @@ nkasmanoff/opencode-sft (HF, single train split)
                     │                                        │
                     │                          ┌─────────────┘
                     │                          ▼
-                    │             eval/run_baseline.py  ← BASELINE on base Laguna
+                    │             eval/run_baseline.py  ← BASELINE on base model
                     │             (opencode harness, before training)
                     ▼
-        train/train.py    (cloud GPU, QLoRA, assistant-only loss)
+        train/train.py    (cloud GPU, bf16 LoRA, assistant-only loss)
                     │
                     ▼
         deploy/deploy.sh                 (GGUF convert + serve)

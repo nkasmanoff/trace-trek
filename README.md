@@ -70,7 +70,7 @@ make eval-tasks
 
 ```
 opencode SQLite DB  ──>  viewer app  ──>  HuggingFace  ──>  train.py --hf-repo
-                (export SFT)       (upload)           (QLoRA on cloud GPU)
+                (export SFT)       (upload)         (bf16 LoRA on cloud GPU)
 ```
 
 ## Key integrations

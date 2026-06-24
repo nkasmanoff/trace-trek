@@ -6,8 +6,8 @@ does not take a model object. To run that gate against the model *while it is
 training* (no second GPU, no vLLM), we expose the live weights at
 `/v1/chat/completions` from inside the training process.
 
-The one non-trivial bit is Laguna's output format. The model does not emit
-OpenAI `tool_calls`; it emits its native XML-ish text, e.g.
+The one non-trivial bit is the model's native output format. Models do not emit
+OpenAI `tool_calls`; they emit native XML-ish text. Laguna:
 
     <think> reasoning... </think>
     <tool_call>calc
@@ -15,10 +15,20 @@ OpenAI `tool_calls`; it emits its native XML-ish text, e.g.
     <arg_value>2+2</arg_value>
     </tool_call>
 
-`parse_generation()` converts that into OpenAI-style `content` +
-`reasoning_content` + `tool_calls` (arguments as a JSON string), which is
-exactly what vLLM's `poolside_v1` / mlx-lm's laguna parser do at deploy time.
-This is eval-only and intentionally minimal (greedy, non-streaming, serialized).
+Qwen3.6 (qwen3_coder format):
+
+    <think> reasoning... </think>
+    <tool_call>
+    <function=calc>
+    <parameter=expr>
+    2+2
+    </parameter>
+    </tool_call>
+
+`parse_generation()` converts either into OpenAI-style `content` +
+`reasoning_content` + `tool_calls` (arguments as a JSON string), which is what
+the matching vLLM tool-call parser does at deploy time. This is eval-only and
+intentionally minimal (greedy, non-streaming, serialized).
 """
 
 from __future__ import annotations
@@ -29,24 +39,33 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+# --- Laguna native format ---
 _TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
 _ARG_RE = re.compile(
     r"<arg_key>\s*(.*?)\s*</arg_key>\s*<arg_value>\s*(.*?)\s*</arg_value>",
     re.DOTALL,
 )
+# --- Qwen3.6 (qwen3_coder) native format ---
+_QWEN_FUNC_RE = re.compile(r"<function=([^>\n]+)>")
+_QWEN_PARAM_RE = re.compile(
+    r"<parameter=([^>\n]+)>\s*(.*?)\s*</parameter>", re.DOTALL)
 # wrappers/markers stripped from the user-facing `content`
-_STRIP = ("<assistant>", "</assistant>", "<think>", "</think>", "\u3008|EOS|\u3009")
+_STRIP = ("<assistant>", "</assistant>", "<think>", "</think>",
+          "<|im_start|>", "<|im_end|>", "\u3008|EOS|\u3009")
+
+
+def _split_reasoning(text: str) -> tuple[str | None, str]:
+    """Split `<think>…</think>` reasoning from the rest. Shared by all formats."""
+    end = text.find("</think>")
+    if end != -1:
+        return text[:end].replace("<think>", "").strip() or None, \
+            text[end + len("</think>"):]
+    return None, text
 
 
 def parse_generation(text: str) -> tuple[str, str | None, list[dict]]:
     """(content, reasoning_content, tool_calls) from raw Laguna generation."""
-    reasoning = None
-    end = text.find("</think>")
-    if end != -1:
-        reasoning = text[:end].replace("<think>", "").strip() or None
-        rest = text[end + len("</think>"):]
-    else:
-        rest = text
+    reasoning, rest = _split_reasoning(text)
 
     tool_calls = []
     for i, m in enumerate(_TOOL_CALL_RE.finditer(rest)):
@@ -65,6 +84,34 @@ def parse_generation(text: str) -> tuple[str, str | None, list[dict]]:
     return content.strip(), reasoning, tool_calls
 
 
+def parse_generation_qwen(text: str) -> tuple[str, str | None, list[dict]]:
+    """(content, reasoning_content, tool_calls) from raw Qwen3.6 generation."""
+    reasoning, rest = _split_reasoning(text)
+
+    tool_calls = []
+    for i, m in enumerate(_TOOL_CALL_RE.finditer(rest)):
+        body = m.group(1)
+        fn = _QWEN_FUNC_RE.search(body)
+        if not fn:
+            continue
+        name = fn.group(1).strip()
+        args = {k.strip(): v.strip() for k, v in _QWEN_PARAM_RE.findall(body)}
+        tool_calls.append({
+            "id": f"call_{i}",
+            "type": "function",
+            "function": {"name": name, "arguments": json.dumps(args)},
+        })
+
+    content = _TOOL_CALL_RE.sub("", rest)
+    for tok in _STRIP:
+        content = content.replace(tok, "")
+    return content.strip(), reasoning, tool_calls
+
+
+_PARSERS = {"laguna": parse_generation, "cohere": parse_generation,
+            "qwen": parse_generation_qwen}
+
+
 class InProcessModelServer:
     """Serve `/v1/chat/completions` (+ `/v1/models`, `/health`) from a live HF
     model. Generation is serialized behind a lock and runs greedily under
@@ -72,13 +119,16 @@ class InProcessModelServer:
 
     def __init__(self, model, tokenizer, *, host: str = "127.0.0.1",
                  port: int = 8848, max_new_tokens: int = 2048,
-                 enable_thinking: bool = True, served_model: str = "local-code-model"):
+                 enable_thinking: bool = True, chat_format: str = "laguna",
+                 served_model: str = "local-code-model"):
         self.model = model
         self.tokenizer = tokenizer
         self.host = host
         self.port = port
         self.max_new_tokens = max_new_tokens
         self.enable_thinking = enable_thinking
+        self.chat_format = chat_format
+        self._parse = _PARSERS.get(chat_format, parse_generation)
         self.served_model = served_model
         self._lock = threading.Lock()
         self._httpd: ThreadingHTTPServer | None = None
@@ -121,7 +171,7 @@ class InProcessModelServer:
             )
         gen = out[0][n_in:]
         raw = self.tokenizer.decode(gen, skip_special_tokens=False)
-        content, reasoning, tool_calls = parse_generation(raw)
+        content, reasoning, tool_calls = self._parse(raw)
         msg = {"role": "assistant", "content": content}
         if reasoning:
             msg["reasoning_content"] = reasoning

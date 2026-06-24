@@ -1,5 +1,5 @@
 """
-Laguna XS.2 on Modal.
+Qwen3.6-35B-A3B on Modal.
 
 Architecture
 ------------
@@ -17,10 +17,10 @@ import urllib.request
 
 import modal
 
-MODEL_NAME = "poolside/Laguna-XS.2-FP8"
-SERVED_NAME = "laguna-xs.2"
+MODEL_NAME = "Qwen/Qwen3.6-35B-A3B-FP8"
+SERVED_NAME = "qwen3.6-35b-a3b"
 GPU = "H100"
-MAX_MODEL_LEN = 262144
+MAX_MODEL_LEN = 65536
 SCALEDOWN_WINDOW = 30
 FAST_BOOT = True
 VLLM_PORT = 8001
@@ -51,7 +51,7 @@ vllm_image = (
 
 vllm_cache_vol = modal.Volume.from_name("vllm-cache", create_if_missing=True)
 
-app = modal.App("laguna-xs2-vllm")
+app = modal.App("qwen3.6-35b-a3b-vllm")
 
 
 @app.cls(
@@ -63,12 +63,11 @@ app = modal.App("laguna-xs2-vllm")
         "/root/.cache/vllm": vllm_cache_vol,
     },
     secrets=[
-        modal.Secret.from_name("laguna-api-key"),
         modal.Secret.from_name("huggingface-secret"),
     ],
 )
 @modal.concurrent(max_inputs=32)
-class LagunaServer:
+class QwenServer:
     @modal.enter()
     def start_engine(self):
         cmd = [
@@ -78,8 +77,8 @@ class LagunaServer:
             "--port", str(VLLM_PORT),
             "--max-model-len", str(MAX_MODEL_LEN),
             "--tensor-parallel-size", "1",
-            "--reasoning-parser", "poolside_v1",
-            "--tool-call-parser", "poolside_v1",
+            "--reasoning-parser", "qwen3",
+            "--tool-call-parser", "qwen3",
             "--enable-auto-tool-choice",
             "--default-chat-template-kwargs", json.dumps({"enable_thinking": True}),
             "--uvicorn-log-level=warning",

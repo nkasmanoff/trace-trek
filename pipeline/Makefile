@@ -63,7 +63,7 @@ upload:
 		--path-in-repo train.jsonl
 
 # ── training ────────────────────────────────────────────────────────────────
-# QLoRA fine-tune Laguna on the local split (run `make split` first).
+# bf16 LoRA fine-tune Qwen3.6 on the local split (run `make split` first).
 
 train:
 	$(PYTHON) train/train.py --data dataset/sft.jsonl \

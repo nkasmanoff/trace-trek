@@ -1,11 +1,13 @@
-# Training dependencies for LoRA fine-tuning Laguna-XS.2 on a CUDA GPU.
-# Install on the pod (PyTorch 2.x / CUDA 12 image; torch is preinstalled there).
+# Training dependencies for LoRA fine-tuning the default base (Qwen3.6-35B-A3B)
+# on a CUDA GPU. Install on the pod (PyTorch 2.x / CUDA 12 image; torch is
+# preinstalled there).
 #
 #   pip install -r requirements.txt
 #
-# Laguna-XS.2 requires transformers >= 5.7.0. The default base is the FP8
-# (compressed-tensors) build, which fits LoRA on one 80GB H100 — see train.py
-# for why plain bitsandbytes QLoRA does not work for this MoE.
+# Qwen3.6 needs a recent transformers (qwen3_5_moe hybrid MoE arch). Default is
+# bf16 LoRA (`--quant none`), which fits one 80GB H100 (~74GB) — 4-bit QLoRA is
+# discouraged for this MoE family. Unsloth is the preferred loader (handles the
+# multimodal text-only path, MoE kernels, and the DeltaNet LoRA targets).
 
 transformers>=5.7.0
 trl
@@ -13,21 +15,20 @@ peft
 datasets
 accelerate
 
-# Fused linear cross-entropy for the FP8 LoRA path. train.py patches Laguna's
-# forward to use Liger so the [seq, vocab] logits tensor (~20GB at 32k ctx) is
-# never materialized — the main thing that lets long context fit in VRAM.
-# Optional: train.py falls back to the standard loss if it can't be imported.
-liger-kernel
-
-# FP8 (compressed-tensors) base loading — required for --quant fp8 (the default).
-compressed-tensors>=0.14
-
-# Only needed for --quant 4bit (bitsandbytes QLoRA on quantizable architectures;
-# NOT effective for Laguna's fused MoE experts).
-bitsandbytes
+# Preferred loader for Qwen3.6 (bf16 LoRA) and the legacy --quant 4bit path.
+# train.py falls back to transformers + PEFT if Unsloth can't load the arch.
+unsloth
 
 wandb
 
-# Optional; only used by the --quant 4bit path. train.py falls back to
-# transformers + PEFT if Unsloth can't load the architecture.
-unsloth
+# Fused linear cross-entropy used by the legacy Laguna FP8 path (train.py
+# patches Laguna's forward so the [seq, vocab] logits tensor is never built).
+# Not applied to Qwen. Optional: train.py falls back to the standard loss.
+liger-kernel
+
+# FP8 (compressed-tensors) base loading — required for any --quant fp8 base.
+compressed-tensors>=0.14
+
+# Only needed for --quant 4bit (bitsandbytes QLoRA). Discouraged for the Qwen
+# MoE family (large quantization error); kept for the legacy paths.
+bitsandbytes
