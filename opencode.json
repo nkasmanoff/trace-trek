@@ -1,5 +1,6 @@
 {
   "$schema": "https://opencode.ai/config.json",
+  "model": "opencode/big-pickle",
   "provider": {
     "laguna-mlx": {
       "npm": "@ai-sdk/openai-compatible",
@@ -14,11 +15,39 @@
           "name": "Laguna XS.2 4bit"
         }
       }
+    },
+    "qwen-mlx": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Qwen MLX (local)",
+      "options": {
+        "baseURL": "http://127.0.0.1:63451/v1",
+        "timeout": 600000,
+        "chunkTimeout": 180000
+      },
+      "models": {
+        "mlx-community/Qwen3.6-35B-A3B-4bit": {
+          "name": "Qwen3.6 35B-A3B 4bit"
+        }
+      }
+    },
+    "openrouter": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "OpenRouter",
+      "options": {
+        "baseURL": "https://openrouter.ai/api/v1",
+        "timeout": 600000,
+        "chunkTimeout": 180000
+      },
+      "models": {
+        "cohere/north-mini-code:free": {
+          "name": "North Mini Code (free)"
+        }
+      }
     }
   },
   "agent": {
     "title": {
-      "disable": true
+      "disable": false
     },
     "summary": {
       "disable": true

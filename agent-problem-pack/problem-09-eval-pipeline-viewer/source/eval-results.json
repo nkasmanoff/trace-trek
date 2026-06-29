@@ -1,0 +1,68 @@
+[
+  {
+    "task_id": "task-alpha-001",
+    "type": "code",
+    "repo": "/workspace/repos/example-api",
+    "run": "baseline-v1",
+    "score": 0.0,
+    "passed": false,
+    "detail": {
+      "changed": ["src/handlers/auth.py"],
+      "expected": ["src/handlers/auth.py", "tests/test_auth.py"]
+    }
+  },
+  {
+    "task_id": "task-alpha-002",
+    "type": "code",
+    "repo": "/workspace/repos/example-api",
+    "run": "baseline-v1",
+    "score": 1.0,
+    "passed": true,
+    "detail": {
+      "changed": ["src/cache/redis.py"],
+      "expected": ["src/cache/redis.py"]
+    }
+  },
+  {
+    "task_id": "task-beta-001",
+    "type": "knowledge",
+    "repo": "/workspace/repos/example-api",
+    "run": "baseline-v1",
+    "score": 0.85,
+    "passed": true,
+    "prompt": "How does request authentication flow through the middleware stack?"
+  },
+  {
+    "task_id": "task-alpha-001",
+    "type": "code",
+    "repo": "/workspace/repos/example-api",
+    "run": "candidate-v2",
+    "score": 1.0,
+    "passed": true,
+    "detail": {
+      "changed": ["src/handlers/auth.py", "tests/test_auth.py"],
+      "expected": ["src/handlers/auth.py", "tests/test_auth.py"]
+    }
+  },
+  {
+    "task_id": "task-alpha-002",
+    "type": "code",
+    "repo": "/workspace/repos/example-api",
+    "run": "candidate-v2",
+    "score": 0.0,
+    "passed": false,
+    "detail": {
+      "changed": ["src/cache/redis.py"],
+      "expected": ["src/cache/redis.py", "src/cache/ttl.py"]
+    }
+  },
+  {
+    "task_id": "task-beta-001",
+    "type": "knowledge",
+    "repo": "/workspace/repos/example-api",
+    "run": "candidate-v2",
+    "score": 0.72,
+    "passed": false,
+    "prompt": "How does request authentication flow through the middleware stack?"
+  }
+]

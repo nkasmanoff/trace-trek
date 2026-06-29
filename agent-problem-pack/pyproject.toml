@@ -1,0 +1,17 @@
+[project]
+name = "agent-problem-pack"
+version = "0.2.0"
+description = "Reproducible repair and comprehension benchmark suite for coding agents"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pytest>=8.0",
+    "hypothesis>=6.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["scripts"]
+pythonpath = ["scripts"]
+
+[tool.uv]
+dev-dependencies = []

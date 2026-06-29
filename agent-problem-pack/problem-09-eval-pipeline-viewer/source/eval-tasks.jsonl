@@ -1,0 +1,3 @@
+{"id": "task-alpha-001", "type": "code", "repo": "/workspace/repos/example-api", "prompt": "Fix the auth handler so expired tokens return 401.", "changed_files": ["src/handlers/auth.py", "tests/test_auth.py"]}
+{"id": "task-alpha-002", "type": "code", "repo": "/workspace/repos/example-api", "prompt": "Add TTL support to the Redis cache wrapper.", "changed_files": ["src/cache/redis.py", "src/cache/ttl.py"]}
+{"id": "task-beta-001", "type": "knowledge", "repo": "/workspace/repos/example-api", "prompt": "How does request authentication flow through the middleware stack?", "reference": "Requests enter through AuthMiddleware, which validates JWTs before routing."}

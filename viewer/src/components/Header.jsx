@@ -17,6 +17,7 @@ export default function Header({ store, watchState, onStartWatch, onStopWatch, o
   }
   if (hasTrace) tabs.push({ view: 'anatomy', label: 'Anatomy' })
   if (hasEval) tabs.push({ view: 'eval', label: 'Eval' })
+  tabs.push({ view: 'run-eval', label: 'Agent Pack' })
 
   return (
     <header className="bar">

@@ -4,6 +4,8 @@ import { execSync } from 'child_process'
 import fs from 'fs'
 import path from 'path'
 import { findDb, listSessions, analytics, exportSessionsFromDb } from './server/db.js'
+import { listProblems, getRuns, getRun, startRun, cancelRun, getFilesystemRuns } from './server/eval-runner.js'
+import { loadCatalog, readRunArtifact, packAvailable } from './server/pack-tools.js'
 import { reconstructSystemPrompt, reconstructTools, harnessAvailable } from './server/harness.js'
 import { exportToSft } from './server/sft.js'
 import { filterThroughBuildDataset, buildDatasetAvailable } from './server/filter.js'
@@ -177,6 +179,97 @@ function opencodeApi() {
           try {
             const data = fetchExport(id)
             sendJson(res, exportToSft(data))
+          } catch (e) { sendError(res, e) }
+          return
+        }
+
+        // Eval runner API
+        if (url === '/api/eval/problems' && req.method === 'GET') {
+          try { sendJson(res, listProblems()) }
+          catch (e) { sendError(res, e) }
+          return
+        }
+
+        if (url === '/api/eval/catalog' && req.method === 'GET') {
+          try {
+            sendJson(res, packAvailable() ? loadCatalog() : { problems: [], filesystem_runs: [] })
+          } catch (e) { sendError(res, e) }
+          return
+        }
+
+        if (url === '/api/eval/filesystem-runs' && req.method === 'GET') {
+          try { sendJson(res, getFilesystemRuns()) }
+          catch (e) { sendError(res, e) }
+          return
+        }
+
+        if (url.startsWith('/api/eval/pack-runs/artifact') && req.method === 'GET') {
+          try {
+            const params = new URL(url, 'http://local').searchParams
+            const runDir = params.get('runDir')
+            const name = params.get('name')
+            if (!runDir || !name) throw new Error('runDir and name required')
+            const text = readRunArtifact(runDir, name)
+            res.setHeader('Content-Type', 'text/plain; charset=utf-8')
+            res.end(text)
+          } catch (e) {
+            res.statusCode = 404
+            res.end(e.message)
+          }
+          return
+        }
+
+        if (url === '/api/eval/runs' && req.method === 'GET') {
+          try { sendJson(res, getRuns()) }
+          catch (e) { sendError(res, e) }
+          return
+        }
+
+        const evalRunMatch = url.match(/^\/api\/eval\/runs\/([^/]+)$/)
+        if (evalRunMatch && req.method === 'GET') {
+          try {
+            const run = getRun(evalRunMatch[1])
+            if (!run) { res.statusCode = 404; res.end('not found'); return }
+            sendJson(res, run)
+          } catch (e) { sendError(res, e) }
+          return
+        }
+
+        const evalDiffMatch = url.match(/^\/api\/eval\/runs\/([^/]+)\/diff\/(\d+)$/)
+        if (evalDiffMatch && req.method === 'GET') {
+          try {
+            const run = getRun(evalDiffMatch[1])
+            if (!run) { res.statusCode = 404; res.end('not found'); return }
+            const prob = run.problems.find(p => p.number === parseInt(evalDiffMatch[2]))
+            if (!prob || !prob.diffPath) { res.statusCode = 404; res.end('not found'); return }
+            if (!fs.existsSync(prob.diffPath)) { res.statusCode = 404; res.end('diff file not found'); return }
+            const diff = fs.readFileSync(prob.diffPath, 'utf-8')
+            res.setHeader('Content-Type', 'text/plain; charset=utf-8')
+            res.end(diff)
+          } catch (e) { sendError(res, e) }
+          return
+        }
+
+        if (url === '/api/eval/run' && req.method === 'POST') {
+          try {
+            const body = await readBody(req)
+            const { model, problems } = JSON.parse(body || '{}')
+            if (!model || !Array.isArray(problems) || !problems.length) {
+              throw new Error('model and problems[] required')
+            }
+            const run = startRun(model, problems)
+            sendJson(res, run)
+          } catch (e) { sendError(res, e) }
+          return
+        }
+
+        if (url === '/api/eval/cancel' && req.method === 'POST') {
+          try {
+            const body = await readBody(req)
+            const { runId } = JSON.parse(body || '{}')
+            if (!runId) throw new Error('runId required')
+            const ok = cancelRun(runId)
+            sendJson(res, { cancelled: ok })
           } catch (e) { sendError(res, e) }
           return
         }

@@ -7,6 +7,7 @@ import AnalyticsView from './components/Analytics/AnalyticsView'
 import DashboardView from './components/Dashboard/DashboardView'
 import AnatomyView from './components/AnatomyView'
 import EvalView from './components/Eval/EvalView'
+import RunEvalView from './components/EvalRunner/RunEvalView'
 import './App.css'
 
 export default function App() {
@@ -117,6 +118,10 @@ export default function App() {
 
         {view === 'eval' && store.hasEvalRows() && (
           <EvalView store={store} onOpenRecord={store.openRecordInAnatomy} />
+        )}
+
+        {view === 'run-eval' && (
+          <RunEvalView store={store} />
         )}
       </main>
 

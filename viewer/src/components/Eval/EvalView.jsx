@@ -26,8 +26,16 @@ export default function EvalView({ store, onOpenRecord }) {
 
   if (!agg.count) {
     return (
-      <div>
-        <div className="meta-bar"><span className="meta-chip">no eval result rows found</span></div>
+      <div className="panel ap-empty-eval">
+        <div className="panel-head">
+          <span className="panel-title">Eval results</span>
+          <span className="panel-sub">Load eval JSON or use Agent Pack runs</span>
+        </div>
+        <p className="ap-muted">
+          No eval rows in the current session. Load an <code>eval-results.json</code> file,
+          or open the <button type="button" className="ap-linkish" onClick={() => store.switchView('run-eval')}>Agent Pack</button> tab
+          to launch problems and inspect captured artifacts.
+        </p>
       </div>
     )
   }

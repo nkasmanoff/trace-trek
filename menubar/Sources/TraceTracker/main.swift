@@ -34,7 +34,7 @@ struct TraceTracker: App {
             }
             .keyboardShortcut("q")
         } label: {
-            Image(systemName: server.isRunning ? "scope.fill" : "scope")
+            Image(systemName: server.isRunning ? "point.3.filled.connected.trianglepath.dotted" : "point.3.connected.trianglepath.dotted")
         }
     }
 }

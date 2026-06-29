@@ -186,6 +186,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eval-gate-opencode", action="store_true",
                    help="include the (slow, streaming) opencode-tasks section; "
                         "off by default — tool-validity + chat-sanity only")
+    p.add_argument("--eval-gate-problem-pack", action="store_true",
+                   help="also run the agent-problem-pack benchmark against the "
+                        "in-training model at each eval-gate cadence (logs "
+                        "pack pass rate to W&B). Needs opencode + uv on PATH.")
+    p.add_argument("--eval-gate-pack-subset", default="smoke",
+                   choices=["smoke", "easy", "medium", "hard", "repair",
+                            "comprehension", "all"],
+                   help="which agent-problem-pack problems the gate runs "
+                        "(default: a quick smoke subset)")
+    p.add_argument("--eval-gate-pack-timeout", type=int, default=900,
+                   help="per-problem opencode timeout for the pack gate")
+    p.add_argument("--eval-gate-skip-core", action="store_true",
+                   help="skip the run_evals.py core sections in the gate "
+                        "(use with --eval-gate-problem-pack to run only the pack)")
     p.add_argument("--push-to-hub", default=None, metavar="REPO_ID",
                    help="after training, upload the LoRA adapter "
                         "(outputs/adapter/) to this HF repo, e.g. "
@@ -809,9 +823,6 @@ class IntermittentEvalCallback:
         return self.server
 
     def _run(self, state, kw, when: str):
-        import os
-        import subprocess
-        import sys
         step = state.global_step
         if step == self._last_step:
             return
@@ -828,37 +839,102 @@ class IntermittentEvalCallback:
         model.config.use_cache = True
         try:
             server = self._ensure_server(model, tokenizer)
-            run_evals = Path(__file__).resolve().parent.parent / "eval" / "run_evals.py"
-            cmd = [sys.executable, str(run_evals),
-                   "--base-url", server.base_url]
-            env = dict(os.environ)
-            if self.cb_args.eval_gate_opencode:
-                workdir = _write_opencode_config(
-                    self.cb_args.out / "opencode-eval", server.base_url,
-                    "local-code-model")
-                cmd += ["--model", "local/local-code-model"]
-                env["PATH"] = os.path.expanduser("~/.opencode/bin") + os.pathsep + env.get("PATH", "")
-                cwd = str(workdir)
-            else:
-                cmd.append("--skip-opencode")
-                cwd = None
-
-            before = {p.name for p in self.eval_dir.glob("results-*.json")}
-            print(f"[eval-gate] step {step} ({when}): {' '.join(cmd)}")
-            subprocess.run(cmd, env=env, cwd=cwd, check=False)
-            new = sorted(p for p in self.eval_dir.glob("results-*.json")
-                         if p.name not in before)
-            if not new:
-                print("[eval-gate] no results file produced")
-                return
-            results = json.loads(new[-1].read_text())
-            self._log(results, step, when)
+            if not self.cb_args.eval_gate_skip_core:
+                self._run_core(server, step, when)
+            if self.cb_args.eval_gate_problem_pack:
+                self._run_pack(server, step, when)
         except Exception as exc:  # noqa: BLE001 — never let eval kill training
             print(f"[eval-gate] FAILED at step {step}: {exc!r}")
         finally:
             model.config.use_cache = prev_cache
             if was_training:
                 model.train()
+
+    def _run_core(self, server, step: int, when: str):
+        """run_evals.py: tool-validity + chat-sanity (+ optional opencode)."""
+        import os
+        import subprocess
+        import sys
+        run_evals = Path(__file__).resolve().parent.parent / "eval" / "run_evals.py"
+        cmd = [sys.executable, str(run_evals), "--base-url", server.base_url]
+        env = dict(os.environ)
+        if self.cb_args.eval_gate_opencode:
+            workdir = _write_opencode_config(
+                self.cb_args.out / "opencode-eval", server.base_url,
+                "local-code-model")
+            cmd += ["--model", "local/local-code-model"]
+            env["PATH"] = os.path.expanduser("~/.opencode/bin") + os.pathsep + env.get("PATH", "")
+            cwd = str(workdir)
+        else:
+            cmd.append("--skip-opencode")
+            cwd = None
+
+        before = {p.name for p in self.eval_dir.glob("results-*.json")}
+        print(f"[eval-gate] step {step} ({when}): {' '.join(cmd)}")
+        subprocess.run(cmd, env=env, cwd=cwd, check=False)
+        new = sorted(p for p in self.eval_dir.glob("results-*.json")
+                     if p.name not in before)
+        if not new:
+            print("[eval-gate] no results file produced")
+            return
+        self._log(json.loads(new[-1].read_text()), step, when)
+
+    def _run_pack(self, server, step: int, when: str):
+        """agent-problem-pack against the in-training model (isolated opencode
+        home so the gate never touches your real opencode.db)."""
+        import os
+        import subprocess
+        import sys
+        runner = Path(__file__).resolve().parent.parent / "eval" / "run_problem_pack.py"
+        if not runner.exists():
+            print("[eval-gate] run_problem_pack.py missing; skipping pack")
+            return
+        home = self.cb_args.out / "pack-opencode-home"
+        cmd = [sys.executable, str(runner),
+               "--base-url", server.base_url,
+               "--served-model", "local-code-model",
+               "--model", "local/local-code-model",
+               "--subset", self.cb_args.eval_gate_pack_subset,
+               "--out", str(self.eval_dir),
+               "--opencode-home", str(home),
+               "--timeout", str(self.cb_args.eval_gate_pack_timeout)]
+        env = dict(os.environ)
+        env["PATH"] = os.path.expanduser("~/.opencode/bin") + os.pathsep + env.get("PATH", "")
+        before = {p.name for p in self.eval_dir.glob("pack-results-*.json")}
+        print(f"[eval-gate] step {step} ({when}) pack: {' '.join(cmd)}")
+        subprocess.run(cmd, env=env, check=False)
+        new = sorted(p for p in self.eval_dir.glob("pack-results-*.json")
+                     if p.name not in before)
+        if not new:
+            print("[eval-gate] no pack results produced")
+            return
+        self._log_pack(json.loads(new[-1].read_text()), step, when)
+
+    def _log_pack(self, results: dict, step: int, when: str):
+        try:
+            import wandb
+        except Exception:  # noqa: BLE001
+            return
+        if wandb.run is None:
+            return
+        pack = results.get("problem_pack") or {}
+        total = pack.get("total", 0)
+        metrics = {"eval_gate/pack_passed": pack.get("passed", 0),
+                   "eval_gate/pack_total": total}
+        if total:
+            metrics["eval_gate/pack_pass_rate"] = pack["passed"] / total
+        for diff, d in (pack.get("by_difficulty") or {}).items():
+            if d.get("total"):
+                metrics[f"eval_gate/pack_{diff}_rate"] = d["passed"] / d["total"]
+        if pack.get("mean_steps") is not None:
+            metrics["eval_gate/pack_mean_steps"] = pack["mean_steps"]
+        if pack.get("mean_tokens") is not None:
+            metrics["eval_gate/pack_mean_tokens"] = pack["mean_tokens"]
+        wandb.log(metrics, step=step)
+        rate = metrics.get("eval_gate/pack_pass_rate")
+        print(f"[eval-gate] step {step} ({when}) pack -> "
+              f"pass_rate={rate:.3f}" if rate is not None
+              else f"[eval-gate] step {step} ({when}) pack -> logged")
 
     def _log(self, results: dict, step: int, when: str):
         try:
@@ -1024,8 +1100,12 @@ def main() -> None:
         if args.eval_gate_at_start:
             cadence.append("at start")
         cadence.append("at end")
-        print(f"eval-gate: on ({', '.join(cadence)}, "
-              f"opencode={'on' if args.eval_gate_opencode else 'off'})")
+        extras = [f"opencode={'on' if args.eval_gate_opencode else 'off'}"]
+        if args.eval_gate_problem_pack:
+            extras.append(f"problem-pack={args.eval_gate_pack_subset}")
+        if args.eval_gate_skip_core:
+            extras.append("core=off")
+        print(f"eval-gate: on ({', '.join(cadence)}, {', '.join(extras)})")
 
     trainer = SFTTrainer(
         model=model,
