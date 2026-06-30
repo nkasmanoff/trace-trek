@@ -1,0 +1,181 @@
+{
+  "problem_pack": {
+    "passed": 12,
+    "total": 14,
+    "rate": 0.8571428571428571,
+    "by_difficulty": {
+      "easy": {
+        "passed": 3,
+        "total": 3
+      },
+      "medium": {
+        "passed": 5,
+        "total": 6
+      },
+      "hard": {
+        "passed": 4,
+        "total": 5
+      }
+    },
+    "mean_tokens": 61738,
+    "mean_steps": 6.2,
+    "problems": [
+      {
+        "id": "problem-01-tokenizer-regression",
+        "kind": "repair",
+        "difficulty": "easy",
+        "passed": true,
+        "timed_out": false,
+        "seconds": 197.6,
+        "tokens": 65026,
+        "steps": 7,
+        "stderr": ""
+      },
+      {
+        "id": "problem-02-shell-command-injection",
+        "kind": "repair",
+        "difficulty": "medium",
+        "passed": true,
+        "timed_out": false,
+        "seconds": 202.0,
+        "tokens": 53997,
+        "steps": 6,
+        "stderr": ""
+      },
+      {
+        "id": "problem-03-cross-platform-task-path",
+        "kind": "repair",
+        "difficulty": "easy",
+        "passed": true,
+        "timed_out": false,
+        "seconds": 200.2,
+        "tokens": 62389,
+        "steps": 7,
+        "stderr": ""
+      },
+      {
+        "id": "problem-04-import-error-after-refactor",
+        "kind": "repair",
+        "difficulty": "easy",
+        "passed": true,
+        "timed_out": false,
+        "seconds": 190.8,
+        "tokens": 52101,
+        "steps": 6,
+        "stderr": ""
+      },
+      {
+        "id": "problem-05-mutable-default-cache",
+        "kind": "repair",
+        "difficulty": "medium",
+        "passed": true,
+        "timed_out": false,
+        "seconds": 191.7,
+        "tokens": 65509,
+        "steps": 7,
+        "stderr": ""
+      },
+      {
+        "id": "problem-06-config-merge-priority",
+        "kind": "repair",
+        "difficulty": "medium",
+        "passed": true,
+        "timed_out": false,
+        "seconds": 211.0,
+        "tokens": 66462,
+        "steps": 7,
+        "stderr": ""
+      },
+      {
+        "id": "problem-07-thread-safe-cache",
+        "kind": "repair",
+        "difficulty": "hard",
+        "passed": true,
+        "timed_out": false,
+        "seconds": 212.7,
+        "tokens": 54861,
+        "steps": 6,
+        "stderr": ""
+      },
+      {
+        "id": "problem-08-pack-lifecycle",
+        "kind": "comprehension",
+        "difficulty": "medium",
+        "passed": false,
+        "timed_out": false,
+        "seconds": 310.5,
+        "tokens": 90356,
+        "steps": 6,
+        "stderr": "\u001b[0m\n> build \u00b7 local-code-model\n\u001b[0m\n\u001b[0m\u2192 \u001b[0mRead source\n\u001b[0m\u2731 \u001b[0mGlob \"source/**/*\"\u001b[90m 2 matches\u001b[0m\n\u001b[0m\u2192 \u001b[0mRead source/pack_tools.py\n\u001b[0m\u2192 \u001b[0mRead source/SKILL.md\n\u001b[0m\u2192 \u001b[0mRead .\n\u001b[0m\u2731 \u001b[0mGlob \"**/problem-08-pack-lifecycle/**\"\u001b[90m 0 matches\u001b[0m\n\u001b[0m\u2192 \u001b[0mRead tests\n\u001b[0m\u2731 \u001b[0mGlob \"**/problem-*/**\"\u001b[90m 0 matches\u001b[0m\n\u001b[0m\u2192 \u001b[0mRead pyproject.toml\n\u001b[0m\u2192 \u001b[0mRead tests/test_answer.py\n"
+      },
+      {
+        "id": "problem-09-eval-pipeline-viewer",
+        "kind": "comprehension",
+        "difficulty": "medium",
+        "passed": true,
+        "timed_out": false,
+        "seconds": 285.2,
+        "tokens": 46737,
+        "steps": 4,
+        "stderr": ""
+      },
+      {
+        "id": "problem-11-eval-scoring-pipeline",
+        "kind": "repair",
+        "difficulty": "hard",
+        "passed": true,
+        "timed_out": false,
+        "seconds": 218.9,
+        "tokens": 106353,
+        "steps": 9,
+        "stderr": ""
+      },
+      {
+        "id": "problem-12-merge-latest-property",
+        "kind": "repair",
+        "difficulty": "hard",
+        "passed": true,
+        "timed_out": false,
+        "seconds": 232.5,
+        "tokens": 77517,
+        "steps": 8,
+        "stderr": ""
+      },
+      {
+        "id": "problem-10-flatten-depth",
+        "kind": "repair",
+        "difficulty": "medium",
+        "passed": true,
+        "timed_out": false,
+        "seconds": 220.3,
+        "tokens": 66332,
+        "steps": 7,
+        "stderr": ""
+      },
+      {
+        "id": "problem-13-persona-vector-extraction",
+        "kind": "comprehension",
+        "difficulty": "hard",
+        "passed": true,
+        "timed_out": false,
+        "seconds": 225.5,
+        "tokens": 46810,
+        "steps": 4,
+        "stderr": ""
+      },
+      {
+        "id": "problem-14-agent-eval-suite",
+        "kind": "comprehension",
+        "difficulty": "hard",
+        "passed": false,
+        "timed_out": true,
+        "seconds": 900.1,
+        "tokens": 9879,
+        "steps": 3,
+        "stderr": "timeout after 900s"
+      }
+    ]
+  },
+  "model": "local/local-code-model",
+  "created": 1782827415
+}

@@ -1,0 +1,181 @@
+{
+  "problem_pack": {
+    "passed": 13,
+    "total": 14,
+    "rate": 0.9285714285714286,
+    "by_difficulty": {
+      "easy": {
+        "passed": 3,
+        "total": 3
+      },
+      "medium": {
+        "passed": 6,
+        "total": 6
+      },
+      "hard": {
+        "passed": 4,
+        "total": 5
+      }
+    },
+    "mean_tokens": 78268,
+    "mean_steps": 8.6,
+    "problems": [
+      {
+        "id": "problem-01-tokenizer-regression",
+        "kind": "repair",
+        "difficulty": "easy",
+        "passed": true,
+        "timed_out": false,
+        "seconds": 271.2,
+        "tokens": 67573,
+        "steps": 9,
+        "stderr": ""
+      },
+      {
+        "id": "problem-02-shell-command-injection",
+        "kind": "repair",
+        "difficulty": "medium",
+        "passed": true,
+        "timed_out": false,
+        "seconds": 345.4,
+        "tokens": 83949,
+        "steps": 10,
+        "stderr": ""
+      },
+      {
+        "id": "problem-03-cross-platform-task-path",
+        "kind": "repair",
+        "difficulty": "easy",
+        "passed": true,
+        "timed_out": false,
+        "seconds": 337.9,
+        "tokens": 89581,
+        "steps": 10,
+        "stderr": ""
+      },
+      {
+        "id": "problem-04-import-error-after-refactor",
+        "kind": "repair",
+        "difficulty": "easy",
+        "passed": true,
+        "timed_out": false,
+        "seconds": 316.4,
+        "tokens": 77092,
+        "steps": 9,
+        "stderr": ""
+      },
+      {
+        "id": "problem-05-mutable-default-cache",
+        "kind": "repair",
+        "difficulty": "medium",
+        "passed": true,
+        "timed_out": false,
+        "seconds": 407.9,
+        "tokens": 99842,
+        "steps": 11,
+        "stderr": ""
+      },
+      {
+        "id": "problem-06-config-merge-priority",
+        "kind": "repair",
+        "difficulty": "medium",
+        "passed": true,
+        "timed_out": false,
+        "seconds": 302.7,
+        "tokens": 75760,
+        "steps": 10,
+        "stderr": ""
+      },
+      {
+        "id": "problem-07-thread-safe-cache",
+        "kind": "repair",
+        "difficulty": "hard",
+        "passed": true,
+        "timed_out": false,
+        "seconds": 351.1,
+        "tokens": 79772,
+        "steps": 10,
+        "stderr": ""
+      },
+      {
+        "id": "problem-08-pack-lifecycle",
+        "kind": "comprehension",
+        "difficulty": "medium",
+        "passed": true,
+        "timed_out": false,
+        "seconds": 268.2,
+        "tokens": 74085,
+        "steps": 5,
+        "stderr": ""
+      },
+      {
+        "id": "problem-09-eval-pipeline-viewer",
+        "kind": "comprehension",
+        "difficulty": "medium",
+        "passed": true,
+        "timed_out": false,
+        "seconds": 254.2,
+        "tokens": 62480,
+        "steps": 5,
+        "stderr": ""
+      },
+      {
+        "id": "problem-11-eval-scoring-pipeline",
+        "kind": "repair",
+        "difficulty": "hard",
+        "passed": false,
+        "timed_out": false,
+        "seconds": 408.6,
+        "tokens": 111901,
+        "steps": 12,
+        "stderr": "ne/gate-1782819798680/workspace/src/evalkit/aggregate.py\n===================================================================\n--- /teamspace/studios/this_studio/trace-trek/agent-problem-pack/runs/problem-11-eval-scoring-pipeline/gate-1782819798680/workspace/src/evalkit/aggregate.py\n+++ /teamspace/studios/this_studio/trace-trek/agent-problem-pack/runs/problem-11-eval-scoring-pipeline/gate-1782819798680/workspace/src/evalkit/aggregate.py\n@@ -25,9 +25,9 @@\n     buckets[(result[\"run\"], result[\"type\"])].append(result)\n \n summaries = []\n for (run, task_type), items in sorted(buckets.items()):\n-    scored = items\n+    scored = [item for item in items if item[\"passed\"] is not None]\n     total = len(scored)\n     passed = sum(1 for item in scored if item[\"passed\"])\n     score_sum = sum(item[\"score\"] for item in scored)\n     pass_rate = passed / total if total else 0.0\n\n\u001b[0m\n\u001b[0m$ \u001b[0mcd /teamspace/studios/this_studio/trace-trek/agent-problem-pack/runs/problem-11-eval-scoring-pipeline/gate-1782819798680/workspace && python -m pytest tests/test_pipeline.py -v 2>&1\n============================= test session starts ==============================\nplatform linux -- Python 3.12.11, pytest-9.1.1, pluggy-1.6.0 -- /home/zeus/miniconda3/envs/cloudspace/bin/python\ncachedir: .pytest_cache\nrootdir: /teamspace/studios/this_studio/trace-trek/agent-problem-pack/runs/problem-11-eval-scoring-pipeline/gate-1782819798680/workspace\nconfigfile: pyproject.toml\nplugins: anyio-4.13.0, typeguard-4.5.2\ncollecting ... collected 4 items\n\ntests/test_pipeline.py::test_ok_task_passes_at_threshold PASSED          [ 25%]\ntests/test_pipeline.py::test_error_task_is_failure PASSED                [ 50%]\ntests/test_pipeline.py::test_skip_task_is_excluded_from_aggregation PASSED [ 75%]\ntests/test_pipeline.py::test_summary_is_formatted PASSED                 [100%]\n\n============================== 4 passed in 0.01s ===============================\n\u001b[0m\n\u001b[0m\u2190 \u001b[0mWrite AGENT_FINAL_ANSWER.md\nWrote file successfully.\n\u001b[0m\n"
+      },
+      {
+        "id": "problem-12-merge-latest-property",
+        "kind": "repair",
+        "difficulty": "hard",
+        "passed": true,
+        "timed_out": false,
+        "seconds": 195.7,
+        "tokens": 43503,
+        "steps": 5,
+        "stderr": ""
+      },
+      {
+        "id": "problem-10-flatten-depth",
+        "kind": "repair",
+        "difficulty": "medium",
+        "passed": true,
+        "timed_out": false,
+        "seconds": 304.8,
+        "tokens": 68603,
+        "steps": 10,
+        "stderr": ""
+      },
+      {
+        "id": "problem-13-persona-vector-extraction",
+        "kind": "comprehension",
+        "difficulty": "hard",
+        "passed": true,
+        "timed_out": false,
+        "seconds": 250.8,
+        "tokens": 62705,
+        "steps": 5,
+        "stderr": ""
+      },
+      {
+        "id": "problem-14-agent-eval-suite",
+        "kind": "comprehension",
+        "difficulty": "hard",
+        "passed": true,
+        "timed_out": false,
+        "seconds": 436.4,
+        "tokens": 98900,
+        "steps": 9,
+        "stderr": ""
+      }
+    ]
+  },
+  "model": "local/local-code-model",
+  "created": 1782821401
+}
