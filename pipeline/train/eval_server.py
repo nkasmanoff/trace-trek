@@ -141,10 +141,42 @@ class InProcessModelServer:
     def _device(self):
         return self.model.get_input_embeddings().weight.device
 
-    def generate(self, messages: list[dict], tools: list | None,
-                 max_tokens: int | None) -> dict:
+    @staticmethod
+    def _normalize_messages(messages: list[dict]) -> list[dict]:
+        """Parse assistant tool_call `arguments` from JSON strings back to dicts.
+        OpenAI clients (opencode's `@ai-sdk/openai-compatible`) send prior-turn
+        tool calls with `arguments` as a JSON *string*, but the Qwen chat
+        template iterates `arguments.items()` and raises
+        `TypeError: Can only get item pairs from a mapping.` on a string — which,
+        on the streaming path, hangs the client until timeout. Mirrors
+        train.py's `normalize_tool_args`."""
+        out = []
+        for m in messages:
+            if m.get("role") == "assistant" and m.get("tool_calls"):
+                m = dict(m)
+                tcs = []
+                for tc in m["tool_calls"]:
+                    tc = dict(tc)
+                    fn = dict(tc.get("function", {}))
+                    args = fn.get("arguments")
+                    if isinstance(args, str):
+                        try:
+                            fn["arguments"] = json.loads(args) if args.strip() else {}
+                        except (json.JSONDecodeError, ValueError):
+                            fn["arguments"] = {}
+                    tc["function"] = fn
+                    tcs.append(tc)
+                m["tool_calls"] = tcs
+            out.append(m)
+        return out
+
+    def _infer(self, messages: list[dict], tools: list | None,
+               max_tokens: int | None) -> tuple[str, str | None, list[dict], int, int]:
+        """Run the model once and parse to (content, reasoning, tool_calls,
+        n_in, n_out). Shared by the streaming and non-streaming responders."""
         import torch
 
+        messages = self._normalize_messages(messages)
         enc = self.tokenizer.apply_chat_template(
             messages, tools=tools or None, add_generation_prompt=True,
             tokenize=True, return_dict=True, return_tensors="pt",
@@ -172,6 +204,12 @@ class InProcessModelServer:
         gen = out[0][n_in:]
         raw = self.tokenizer.decode(gen, skip_special_tokens=False)
         content, reasoning, tool_calls = self._parse(raw)
+        return content, reasoning, tool_calls, int(n_in), int(gen.shape[0])
+
+    def generate(self, messages: list[dict], tools: list | None,
+                 max_tokens: int | None) -> dict:
+        content, reasoning, tool_calls, n_in, n_out = self._infer(
+            messages, tools, max_tokens)
         msg = {"role": "assistant", "content": content}
         if reasoning:
             msg["reasoning_content"] = reasoning
@@ -187,10 +225,51 @@ class InProcessModelServer:
                 "message": msg,
                 "finish_reason": "tool_calls" if tool_calls else "stop",
             }],
-            "usage": {"prompt_tokens": int(n_in),
-                      "completion_tokens": int(gen.shape[0]),
-                      "total_tokens": int(n_in + gen.shape[0])},
+            "usage": {"prompt_tokens": n_in,
+                      "completion_tokens": n_out,
+                      "total_tokens": n_in + n_out},
         }
+
+    def stream(self, messages: list[dict], tools: list | None,
+               max_tokens: int | None):
+        """Yield OpenAI-style chat.completion.chunk SSE events. opencode's
+        `@ai-sdk/openai-compatible` provider always requests `stream: true` and
+        parses the body as `text/event-stream`; a non-streaming JSON body yields
+        an empty turn on its side. Generation is non-incremental here, so we run
+        the model fully and then emit the result as a few well-formed deltas."""
+        content, reasoning, tool_calls, n_in, n_out = self._infer(
+            messages, tools, max_tokens)
+        cid = f"chatcmpl-{int(time.time()*1000)}"
+        created = int(time.time())
+
+        def event(delta: dict, finish=None, extra: dict | None = None) -> str:
+            payload = {
+                "id": cid, "object": "chat.completion.chunk", "created": created,
+                "model": self.served_model,
+                "choices": [{"index": 0, "delta": delta,
+                             "finish_reason": finish}],
+            }
+            if extra:
+                payload.update(extra)
+            return "data: " + json.dumps(payload) + "\n\n"
+
+        yield event({"role": "assistant"})
+        if reasoning:
+            yield event({"reasoning_content": reasoning})
+        if content:
+            yield event({"content": content})
+        if tool_calls:
+            tc_delta = [{
+                "index": i, "id": tc["id"], "type": "function",
+                "function": {"name": tc["function"]["name"],
+                             "arguments": tc["function"]["arguments"]},
+            } for i, tc in enumerate(tool_calls)]
+            yield event({"tool_calls": tc_delta})
+        yield event({}, finish="tool_calls" if tool_calls else "stop",
+                    extra={"usage": {"prompt_tokens": n_in,
+                                     "completion_tokens": n_out,
+                                     "total_tokens": n_in + n_out}})
+        yield "data: [DONE]\n\n"
 
     def start(self) -> str:
         if self._httpd is not None:
@@ -229,11 +308,34 @@ class InProcessModelServer:
                     self._send(404, {"error": "not found"})
                     return
                 try:
-                    resp = server.generate(
-                        req.get("messages", []), req.get("tools"),
-                        req.get("max_tokens"))
-                    self._send(200, resp)
+                    if req.get("stream"):
+                        # SSE: opencode's openai-compatible provider parses the
+                        # body as text/event-stream; a plain JSON body there
+                        # produces an empty assistant turn. We have no
+                        # Content-Length and don't chunk-encode, so the client
+                        # can only detect end-of-body via connection close —
+                        # `Connection: close` + close_connection avoids a
+                        # keep-alive deadlock that hangs the client after the
+                        # final event is written.
+                        self.close_connection = True
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/event-stream")
+                        self.send_header("Cache-Control", "no-cache")
+                        self.send_header("Connection", "close")
+                        self.end_headers()
+                        for ev in server.stream(
+                                req.get("messages", []), req.get("tools"),
+                                req.get("max_tokens")):
+                            self.wfile.write(ev.encode())
+                            self.wfile.flush()
+                    else:
+                        resp = server.generate(
+                            req.get("messages", []), req.get("tools"),
+                            req.get("max_tokens"))
+                        self._send(200, resp)
                 except Exception as exc:  # noqa: BLE001
+                    import traceback
+                    traceback.print_exc()
                     self._send(500, {"error": repr(exc)})
 
         self._httpd = ThreadingHTTPServer((self.host, self.port), Handler)

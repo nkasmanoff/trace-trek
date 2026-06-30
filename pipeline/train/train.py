@@ -688,6 +688,94 @@ def apply_liger_laguna(model) -> bool:
     return True
 
 
+def apply_liger_qwen3_5_moe(model) -> bool:
+    """Patch Qwen3_5MoeForCausalLM to compute the LM loss with Liger's fused
+    linear cross-entropy. Qwen3.6's vocab is ~248k, so the standard forward's
+    `[seq, 248k]` logits tensor (upcast to fp32 in cross-entropy) is the single
+    biggest VRAM consumer at long context (e.g. ~80GB at 81920 tokens) and the
+    reason bf16 LoRA had to drop to short context. Liger fuses the lm_head matmul
+    + cross-entropy and chunks over tokens, so the full logits tensor is never
+    built — restoring long-context training. The MoE router aux-loss is left on
+    the standard path. Qwen3.6 isn't in Liger's auto-patch list, so we wire it
+    manually (mirrors apply_liger_laguna). Returns True if applied."""
+    if "qwen3_5_moe" not in getattr(model.config, "model_type", ""):
+        return False
+    try:
+        from liger_kernel.transformers.model.loss_utils import (
+            LigerForCausalLMLoss, unpack_cross_entropy_result)
+        from liger_kernel.transformers.model.mixtral import (
+            LigerMoeCausalLMOutputWithPast)
+        from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as mq
+    except Exception as exc:  # noqa: BLE001
+        print(f"liger: unavailable ({exc!r}); using standard loss")
+        return False
+
+    def lce_forward(self, input_ids=None, attention_mask=None, position_ids=None,
+                    past_key_values=None, inputs_embeds=None, labels=None,
+                    use_cache=None, output_router_logits=None,
+                    cache_position=None, logits_to_keep=0, skip_logits=None,
+                    **kwargs):
+        output_router_logits = (output_router_logits
+                                if output_router_logits is not None
+                                else self.config.output_router_logits)
+        # TRL passes these to control metrics; keep them out of the base model
+        return_token_accuracy = kwargs.pop("return_token_accuracy", False)
+        kwargs.pop("use_token_scaling", None)
+        shift_labels = kwargs.pop("shift_labels", None)
+
+        outputs = self.model(
+            input_ids=input_ids, attention_mask=attention_mask,
+            position_ids=position_ids, past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds, use_cache=use_cache,
+            output_router_logits=output_router_logits,
+            cache_position=cache_position, **kwargs,
+        )
+        hidden_states = outputs.last_hidden_state
+        slice_indices = (slice(-logits_to_keep, None)
+                         if isinstance(logits_to_keep, int) else logits_to_keep)
+        kept = hidden_states[:, slice_indices, :]
+
+        logits = loss = token_accuracy = predicted_tokens = None
+        if skip_logits is None:
+            # Fuse whenever labels are present (BOTH train and eval-loss passes)
+            # so the [seq, 248k] logits tensor is never built at long context;
+            # only generation (labels is None) takes the lm_head path below.
+            skip_logits = labels is not None or shift_labels is not None
+        if skip_logits:
+            # fused: no [seq, vocab] logits tensor is materialized
+            result = LigerForCausalLMLoss(
+                hidden_states=kept, lm_head_weight=self.lm_head.weight,
+                labels=labels, shift_labels=shift_labels,
+                hidden_size=self.config.hidden_size,
+                return_token_accuracy=return_token_accuracy, **kwargs)
+            loss, _, token_accuracy, predicted_tokens = \
+                unpack_cross_entropy_result(result)
+        else:
+            logits = self.lm_head(kept)
+            if labels is not None or shift_labels is not None:
+                loss = self.loss_function(
+                    logits=logits, labels=labels, shift_labels=shift_labels,
+                    vocab_size=self.vocab_size, **kwargs)
+
+        aux_loss = None
+        if output_router_logits:
+            aux_loss = mq.load_balancing_loss_func(
+                outputs.router_logits, self.num_experts,
+                self.num_experts_per_tok, attention_mask)
+            if loss is not None and aux_loss is not None:
+                loss = loss + self.router_aux_loss_coef * aux_loss.to(loss.device)
+
+        return LigerMoeCausalLMOutputWithPast(
+            loss=loss, aux_loss=aux_loss, logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states, attentions=outputs.attentions,
+            router_logits=outputs.router_logits,
+            token_accuracy=token_accuracy, predicted_tokens=predicted_tokens)
+
+    mq.Qwen3_5MoeForCausalLM.forward = lce_forward
+    return True
+
+
 def load_lora(args, fmt: str):
     """LoRA on a model loaded in its native precision (no bitsandbytes).
 
@@ -705,12 +793,23 @@ def load_lora(args, fmt: str):
     tokenizer = AutoTokenizer.from_pretrained(args.base)
     # transformers reads the FP8 build's own quantization_config
     # (compressed-tensors); a plain bf16 repo just loads in bf16.
-    model = AutoModelForCausalLM.from_pretrained(
-        args.base,
+    # `experts_implementation="grouped_mm"` is essential for the Qwen MoE: the
+    # default `batched_mm` path gathers a per-token copy of every selected
+    # expert's weights (`gate_up_proj[expert_ids]`), which blows up to ~88GB and
+    # OOMs even at short context. grouped_mm sorts tokens by expert and uses
+    # torch._grouped_mm (Hopper SM90+/torch>=2.9), so no per-token weight copy.
+    load_kwargs = dict(
         dtype=torch.bfloat16,
         device_map="auto",
         attn_implementation="sdpa",
     )
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.base, experts_implementation="grouped_mm", **load_kwargs)
+        print("experts: grouped_mm (memory-efficient MoE)")
+    except (ValueError, ImportError, TypeError) as exc:
+        print(f"experts: grouped_mm unavailable ({exc!r}); using default")
+        model = AutoModelForCausalLM.from_pretrained(args.base, **load_kwargs)
     model.config.use_cache = False
     # needed so gradients reach LoRA params through a frozen/quantized base
     # when gradient checkpointing is on
@@ -837,6 +936,21 @@ class IntermittentEvalCallback:
         prev_cache = getattr(model.config, "use_cache", False)
         model.eval()
         model.config.use_cache = True
+        # MoE aux-loss: when training enables output_router_logits, the model's
+        # forward calls load_balancing_loss_func, which crashes during *cached*
+        # generation (per-decode-step router logits mismatch attention_mask:
+        # "tensor a (num_layers) must match tensor b (N)"). Force it off across
+        # the model + text configs while the gate generates; restore after.
+        cfgs = []
+        seen = set()
+        for c in (getattr(model, "config", None),
+                  getattr(getattr(model, "config", None),
+                          "get_text_config", lambda: None)()):
+            if c is not None and id(c) not in seen and hasattr(
+                    c, "output_router_logits"):
+                cfgs.append((c, c.output_router_logits))
+                seen.add(id(c))
+                c.output_router_logits = False
         try:
             server = self._ensure_server(model, tokenizer)
             if not self.cb_args.eval_gate_skip_core:
@@ -847,6 +961,8 @@ class IntermittentEvalCallback:
             print(f"[eval-gate] FAILED at step {step}: {exc!r}")
         finally:
             model.config.use_cache = prev_cache
+            for c, v in cfgs:
+                c.output_router_logits = v
             if was_training:
                 model.train()
 
@@ -982,6 +1098,20 @@ def main() -> None:
     args = parse_args()
     load_dotenv(Path(__file__).resolve().parent)
     args.out.mkdir(parents=True, exist_ok=True)
+
+    # cuDNN's fused SDPA backend intermittently raises
+    # "mha_graph.execute(...).is_good() == false" on Qwen3.6's full-attention
+    # layers once the eval-gate has run long-context generation (memory
+    # fragmentation) — it crashed training mid-step right after the step-20 gate.
+    # Disable only the cuDNN SDPA backend so PyTorch falls back to the robust
+    # flash / mem-efficient / math kernels. One process, so this covers both
+    # training and the in-process eval server.
+    import torch
+    try:
+        torch.backends.cuda.enable_cudnn_sdp(False)
+        print("sdpa: cuDNN attention backend disabled (flash/mem-efficient only)")
+    except Exception as exc:  # noqa: BLE001
+        print(f"sdpa: could not disable cuDNN backend ({exc!r})")
     fmt = resolve_chat_format(args)
     quant = resolve_quant(args)
     fmt_cfg = CHAT_FORMATS[fmt]
@@ -1024,9 +1154,9 @@ def main() -> None:
 
     liger_on = False
     if not args.no_liger and not is_unsloth:
-        liger_on = apply_liger_laguna(model)
+        liger_on = apply_liger_laguna(model) or apply_liger_qwen3_5_moe(model)
         print("liger: fused linear cross-entropy enabled (frees logits VRAM)"
-              if liger_on else "liger: not applied (non-Laguna arch); standard loss")
+              if liger_on else "liger: not applied (unknown arch); standard loss")
 
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -1063,7 +1193,12 @@ def main() -> None:
         lr_scheduler_type="cosine",
         warmup_ratio=0.03,
         logging_steps=5,
-        save_strategy="epoch",
+        # step-based checkpointing (aligned to the gate cadence) so a crash
+        # mid-run is resumable instead of losing the whole epoch
+        save_strategy="steps",
+        save_steps=(args.eval_gate_steps if args.eval_gate
+                    and args.eval_gate_steps > 0 else 20),
+        save_total_limit=2,
         bf16=True,
         max_length=args.max_seq_len,
         # rows are already tokenized (input_ids + masked labels); don't let TRL
