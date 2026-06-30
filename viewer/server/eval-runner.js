@@ -1,9 +1,14 @@
-import { execSync, execFileSync, spawn } from 'child_process'
+import { execSync, execFileSync, spawn, spawnSync } from 'child_process'
 import fs from 'fs'
 import path from 'path'
 import os from 'os'
+import { fileURLToPath } from 'url'
 import { PACK_ROOT, loadCatalog, loadProblems } from './pack-tools.js'
 import { summarizeVerification } from './failure-analysis.js'
+import { resolvePython } from './python.js'
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const QUERY_SCRIPT = path.join(__dirname, 'opencode_db.py')
 
 const OPENCODE = process.env.OPENCODE_BIN || path.join(os.homedir(), '.opencode/bin/opencode')
 const EVAL_RUNS_FILE = path.join(os.homedir(), '.opencode', 'eval-runs.json')
@@ -255,10 +260,19 @@ const OPENCODE_DB_PATHS = [
 ]
 
 function sqliteJson(dbPath, sql) {
-  const out = execFileSync('sqlite3', ['-readonly', '-json', dbPath, sql], {
-    encoding: 'utf-8', timeout: 10000, maxBuffer: 16 * 1024 * 1024,
-  })
-  return JSON.parse(out.trim() || '[]')
+  const outFile = path.join(os.tmpdir(), `ocdb_${process.pid}_${Date.now()}.json`)
+  const py = resolvePython()
+  try {
+    const res = spawnSync(py, [QUERY_SCRIPT, dbPath, '--out', outFile], {
+      input: sql,
+      encoding: 'utf-8',
+      timeout: 60000,
+    })
+    if (res.error || res.status !== 0) throw new Error(res.stderr || res.error?.message || 'db query failed')
+    return JSON.parse(fs.readFileSync(outFile, 'utf-8').trim() || '[]')
+  } finally {
+    try { fs.unlinkSync(outFile) } catch {}
+  }
 }
 
 // Token + step usage for a completed session, summed across the main session and
@@ -295,10 +309,8 @@ function findSessionId(workspaceDir) {
     if (!fs.existsSync(dbPath)) continue
     try {
       const escaped = workspaceDir.replace(/'/g, "''")
-      const out = execSync(`sqlite3 -readonly -json "${dbPath}" "SELECT id FROM session WHERE directory = '${escaped}' ORDER BY time_updated DESC LIMIT 1"`, {
-        encoding: 'utf-8', timeout: 10000,
-      })
-      const rows = JSON.parse(out.trim() || '[]')
+      const rows = sqliteJson(dbPath,
+        `SELECT id FROM session WHERE directory = '${escaped}' ORDER BY time_updated DESC LIMIT 1`)
       if (rows.length) return rows[0].id
     } catch {}
   }

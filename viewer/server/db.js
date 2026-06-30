@@ -1,7 +1,13 @@
-import { execFileSync } from 'child_process'
-import { existsSync } from 'fs'
-import { homedir } from 'os'
+import { spawnSync } from 'child_process'
+import { existsSync, readFileSync, unlinkSync } from 'fs'
+import { tmpdir, homedir } from 'os'
 import path from 'path'
+import { fileURLToPath } from 'url'
+import { resolvePython } from './python.js'
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const QUERY_SCRIPT = path.join(__dirname, 'opencode_db.py')
+const QUERY_TIMEOUT = 300000 // 5 min — large DB exports can be slow under load
 
 const DB_CANDIDATES = [
   path.join(homedir(), '.local/share/opencode/opencode.db'),
@@ -14,14 +20,31 @@ export function findDb() {
 }
 
 function query(dbPath, sql) {
-  const out = execFileSync('sqlite3', ['-readonly', '-json', dbPath, sql], {
-    encoding: 'utf-8',
-    maxBuffer: 256 * 1024 * 1024,
-    timeout: 30000,
-  })
-  const trimmed = out.trim()
-  if (!trimmed) return []
-  return JSON.parse(trimmed)
+  const outFile = path.join(tmpdir(), `ocdb_${process.pid}_${Date.now()}.json`)
+  const py = resolvePython()
+  try {
+    const res = spawnSync(py, [QUERY_SCRIPT, dbPath, '--out', outFile], {
+      input: sql,
+      encoding: 'utf-8',
+      timeout: QUERY_TIMEOUT,
+    })
+    if (res.error) {
+      const hint = res.error.code === 'ETIMEDOUT'
+        ? ' (opencode.db read timed out — close heavy opencode sessions and retry)'
+        : res.error.code === 'EPIPE'
+          ? ' (db query subprocess failed while reading opencode.db)'
+          : ''
+      throw new Error(String(res.error.message || res.error) + hint)
+    }
+    if (res.status !== 0) {
+      throw new Error((res.stderr || 'db query failed').trim().slice(0, 500))
+    }
+    const trimmed = readFileSync(outFile, 'utf-8').trim()
+    if (!trimmed) return []
+    return JSON.parse(trimmed)
+  } finally {
+    try { unlinkSync(outFile) } catch {}
+  }
 }
 
 const DEAD_LIKE = [

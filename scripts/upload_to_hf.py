@@ -48,6 +48,8 @@ def main() -> int:
                    help="dataset repo id; bare name is placed under your namespace")
     p.add_argument("--path-in-repo", default="train.jsonl",
                    help="destination filename inside the dataset repo")
+    p.add_argument("--input-file",
+                   help="read dataset from this file instead of stdin")
     p.add_argument("--private", action="store_true", default=True)
     p.add_argument("--public", dest="private", action="store_false")
     args = p.parse_args()
@@ -63,7 +65,7 @@ def main() -> int:
         print(json.dumps({"ok": False, "error": "no HF token (set HF_TOKEN or self-improve/.env)"}))
         return 1
 
-    data = sys.stdin.buffer.read()
+    data = Path(args.input_file).read_bytes() if args.input_file else sys.stdin.buffer.read()
     if not data.strip():
         print(json.dumps({"ok": False, "error": "empty dataset (nothing to upload)"}))
         return 1
