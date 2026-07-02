@@ -76,6 +76,17 @@ function buildSftJsonl(dbPath, opts) {
     throw new Error('no exportable records (sessions had no usable messages)')
   }
 
+  // compute model/token summary from the pre-filter records
+  const models = [...new Set(records.map(r => r.model).filter(Boolean))]
+  const tokenSummary = records.reduce((acc, r) => {
+    if (r.tokens) {
+      acc.input += r.tokens.input || 0
+      acc.output += r.tokens.output || 0
+      acc.reasoning += r.tokens.reasoning || 0
+    }
+    return acc
+  }, { input: 0, output: 0, reasoning: 0 })
+
   if (filter) {
     if (!buildDatasetAvailable()) throw new Error('build_dataset.py not found — cannot apply quality filters')
     const out = filterThroughBuildDataset(records, {
@@ -85,9 +96,9 @@ function buildSftJsonl(dbPath, opts) {
     })
     const count = (out.jsonl.trim().match(/\n/g) || []).length + (out.jsonl.trim() ? 1 : 0)
     if (!count) throw new Error('all records were dropped by the quality filter (corrections / loops / too-long / dedup)')
-    return { jsonl: out.jsonl, count }
+    return { jsonl: out.jsonl, count, models, tokens: tokenSummary }
   }
-  return { jsonl: records.map(r => JSON.stringify(r)).join('\n') + '\n', count: records.length }
+  return { jsonl: records.map(r => JSON.stringify(r)).join('\n') + '\n', count: records.length, models, tokens: tokenSummary }
 }
 
 function opencodeApi() {
@@ -162,12 +173,12 @@ function opencodeApi() {
               throw new Error('no session ids provided')
             }
             if (!hfAvailable()) throw new Error('HF upload unavailable (no token or uploader script)')
-            const { jsonl, count } = buildSftJsonl(dbPath, opts)
+            const { jsonl, count, models, tokens } = buildSftJsonl(dbPath, opts)
             const result = uploadToHf(jsonl, {
               repo: opts.repo || 'opencode-sft',
               pathInRepo: 'train.jsonl',
             })
-            sendJson(res, { ...result, exported: count })
+            sendJson(res, { ...result, exported: count, models, tokens })
           } catch (e) { sendError(res, e) }
           return
         }

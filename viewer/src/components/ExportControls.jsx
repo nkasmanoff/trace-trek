@@ -40,7 +40,15 @@ export default function ExportControls({
     setBusy('upload'); setStatus(null)
     try {
       const r = await onUpload(opts())
-      if (r) setStatus({ ok: `Uploaded ${r.exported} record${r.exported === 1 ? '' : 's'} → ${r.repo_id}`, url: r.url })
+      if (r) {
+        const modelLabel = r.models?.length ? `model: ${r.models.join(', ')}` : ''
+        const tokenLabel = r.tokens ? `tokens: ${(r.tokens.input + r.tokens.output).toLocaleString()}` : ''
+        const extras = [modelLabel, tokenLabel].filter(Boolean).join(' · ')
+        setStatus({
+          ok: `Uploaded ${r.exported} record${r.exported === 1 ? '' : 's'} → ${r.repo_id}${extras ? ' (' + extras + ')' : ''}`,
+          url: r.url,
+        })
+      }
     } catch (e) { setStatus({ err: e.message }) }
     finally { setBusy(null) }
   }

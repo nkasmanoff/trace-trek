@@ -94,6 +94,9 @@ export function exportToSft(data, opts = {}) {
     messages,
     tools: tools.length ? tools : null,
     source: sourceFor(info),
+    model: info.model?.id || null,
+    tokens: info.tokens || null,
+    cost: info.cost || null,
     // provenance so downstream knows these were rebuilt, not captured
     _reconstructed: {
       system: !!sys,

@@ -15,8 +15,27 @@ Problems are intentionally small. Each repair task should be solvable with a loc
 
 | Kind | Count | Verification | What “pass” means |
 | --- | --- | --- | --- |
-| `repair` | 10 | `pytest` in an isolated workspace | All tests green after the agent’s edits |
+| `repair` | 16 | `pytest` (or `node --test`) in an isolated workspace | All tests green after the agent’s edits |
 | `comprehension` | 4 | Keyword/concept checks on `AGENT_FINAL_ANSWER.md` | Written answer covers required lifecycle or pipeline concepts |
+| `implement` | 6 | Hidden tests only | The agent inferred the intended change from a terse commit-style request plus repo conventions, with no feedback loop |
+| `grounding` | 1 | Execution-derived checks on `AGENT_FINAL_ANSWER.md` | The answer contains values (hash token, counts) only obtainable by running workspace code |
+
+Problems 25–27 target the frontier-vs-local gap observed in early runs
+(baseline Qwen3.6-35B-A3B failed exactly the `implement` tasks big-pickle
+passed): terse-spec implementation where the full contract lives in a
+docstring or docs file (`problem-25`, `problem-27`) and multi-invariant
+stateful repair where a visible test exposes one bug but hidden tests grade
+the whole documented contract (`problem-26`). They reward contract recovery
+and exact-formatting discipline over brute-force iteration.
+
+Problems 15–24 are deliberately hard: they are shaped like the opencode SFT
+trace distribution (commit-message implementation, repo navigation, precise
+edits, multi-turn follow-ups, grounded execution) and most models are
+expected to fail several of them. If pass rates saturate, the secondary
+metrics captured per run — tokens, steps, tool-call error rate, edit-tool
+failures, tool loops (see `pipeline/eval/run_problem_pack.py`) — still
+separate models: fine-tuning should reduce tokens-per-solve and harness
+mechanics errors before it moves pass rates.
 
 Repair problems span common failure modes seen in agent benchmarks and production codebases:
 
@@ -107,6 +126,21 @@ For repair tasks, **test pass rate is necessary but not sufficient**. The evalua
 - Does the fix look like a minimal safe change vs. a brittle workaround?
 
 For comprehension tasks, pytest checks required vocabulary and concepts. A human or judge model should still assess clarity and correctness of the explanation.
+
+## Train/eval contamination gate
+
+Because the fine-tuning data is opencode traces from the same machine that
+authored this pack, a trace that discusses a problem's source material would
+let the model partially memorize the eval. `scripts/check_contamination.py`
+scans an SFT JSONL for problem-specific markers (source file names, symbol
+names) and exits nonzero on any hit:
+
+```bash
+uv run python scripts/check_contamination.py ../pipeline/dataset/sft.jsonl
+```
+
+Run it whenever the dataset is rebuilt (`make split`) or a new problem is
+added; `--write-clean` emits a filtered copy.
 
 ## Pack integrity
 

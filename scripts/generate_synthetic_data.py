@@ -117,7 +117,6 @@ def _powered_by_line(model_id: str) -> str:
 def _env_block(scenario: "Scenario") -> str:
     return "\n".join(
         [
-            "Here is some useful information about the environment you are running in:",
             "<env>",
             f"  Working directory: {scenario.cwd}",
             f"  Workspace root folder: {scenario.cwd}",

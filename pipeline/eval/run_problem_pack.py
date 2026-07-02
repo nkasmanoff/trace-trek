@@ -54,8 +54,12 @@ def select_problems(subset: str, explicit: list[str] | None) -> list[str]:
         return ids
     if subset in ("easy", "medium", "hard"):
         return [i for i, p in problems.items() if p.difficulty == subset]
-    if subset in ("repair", "comprehension"):
+    if subset in ("repair", "comprehension", "implement", "grounding"):
         return [i for i, p in problems.items() if p.kind == subset]
+    if subset == "new":
+        # the hard additions (15+): harness-driving tasks aligned with the
+        # opencode SFT trace distribution
+        return [i for i in ids if int(i.split("-")[1]) >= 15]
     if subset == "smoke":
         # a couple of quick repairs + the first comprehension: cheap signal
         repairs = [i for i, p in problems.items()
@@ -89,8 +93,11 @@ def write_opencode_config(home: Path, base_url: str, served: str) -> Path:
 
 
 def session_stats(home: Path, workspace: Path) -> dict | None:
-    """Best-effort token/step counts from the isolated opencode.db for the
-    session opencode created in this workspace. Returns None on any problem."""
+    """Best-effort harness-mechanics stats from the isolated opencode.db for
+    the session opencode created in this workspace: tokens and steps, plus
+    per-tool call counts, tool-call error counts, and tool-call loops (the
+    same signals build_dataset.py uses as training-data quality filters).
+    Returns None on any problem."""
     import sqlite3
     db = home / ".local" / "share" / "opencode" / "opencode.db"
     if not db.exists():
@@ -116,9 +123,46 @@ def session_stats(home: Path, workspace: Path) -> dict | None:
         steps = con.execute(
             f"SELECT count(*) c FROM message WHERE session_id IN ({ph}) "
             f"AND json_extract(data,'$.role')='assistant'", ids).fetchone()["c"]
+
+        tool_calls: dict[str, int] = {}
+        for r in con.execute(
+                f"SELECT json_extract(data,'$.tool') t, count(*) c FROM part "
+                f"WHERE session_id IN ({ph}) AND "
+                f"json_extract(data,'$.type')='tool' GROUP BY 1", ids):
+            if r["t"]:
+                tool_calls[r["t"]] = int(r["c"])
+        tool_errors = con.execute(
+            f"SELECT count(*) c FROM part WHERE session_id IN ({ph}) AND "
+            f"json_extract(data,'$.type')='tool' AND "
+            f"json_extract(data,'$.state.status')='error'", ids).fetchone()["c"]
+        edit_errors = con.execute(
+            f"SELECT count(*) c FROM part WHERE session_id IN ({ph}) AND "
+            f"json_extract(data,'$.type')='tool' AND "
+            f"json_extract(data,'$.tool') IN ('edit','write') AND "
+            f"json_extract(data,'$.state.status')='error'", ids).fetchone()["c"]
+
+        # Loop detection: 3+ consecutive identical (tool, input) calls.
+        seq = [(r["t"], r["i"]) for r in con.execute(
+            f"SELECT json_extract(data,'$.tool') t, "
+            f"json_extract(data,'$.state.input') i FROM part "
+            f"WHERE session_id IN ({ph}) AND "
+            f"json_extract(data,'$.type')='tool' ORDER BY rowid", ids)]
+        loops, streak = 0, 1
+        for prev, cur in zip(seq, seq[1:]):
+            if cur == prev and cur[0] is not None:
+                streak += 1
+                if streak == 3:
+                    loops += 1
+            else:
+                streak = 1
         con.close()
         return {"tokens": int(tok["i"]) + int(tok["o"]),
-                "steps": int(steps), "sessionId": sid}
+                "steps": int(steps), "sessionId": sid,
+                "toolCalls": sum(tool_calls.values()),
+                "toolCallsByName": tool_calls,
+                "toolErrors": int(tool_errors),
+                "editErrors": int(edit_errors),
+                "toolLoops": int(loops)}
     except Exception:  # noqa: BLE001 — stats are optional
         return None
 
@@ -130,19 +174,25 @@ def run_one(problem_id: str, model: str, env: dict, home: Path | None,
     run_name = f"gate-{int(time.time() * 1000)}"
     run_dir = pack_tools.prepare_run(PACK_ROOT, problem_id, run_name)
     workspace = (run_dir / "workspace").resolve()
-    prompt = (pack_tools.task_prompt_text(problem) +
-              "\n\nAt the end, write your concise final answer to "
-              "AGENT_FINAL_ANSWER.md in this workspace.")
-    cmd = [OPENCODE, "run", "--model", model,
-           "--dangerously-skip-permissions", "--dir", str(workspace), prompt]
+    prompts = [pack_tools.task_prompt_text(problem)] + list(problem.turns)
 
     t0 = time.time()
     timed_out = False
     stderr = ""
     try:
-        proc = subprocess.run(cmd, cwd=str(workspace), env=env,
-                              capture_output=True, text=True, timeout=timeout)
-        stderr = (proc.stderr or "")[-2000:]
+        for turn_index, prompt in enumerate(prompts):
+            cmd = [OPENCODE, "run", "--model", model,
+                   "--dangerously-skip-permissions", "--dir", str(workspace)]
+            if turn_index > 0:
+                cmd.append("--continue")
+            cmd.append(prompt)
+            remaining = timeout - (time.time() - t0)
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(cmd, timeout)
+            proc = subprocess.run(cmd, cwd=str(workspace), env=env,
+                                  capture_output=True, text=True,
+                                  timeout=remaining)
+            stderr = (proc.stderr or "")[-2000:]
     except subprocess.TimeoutExpired:
         timed_out = True
         stderr = f"timeout after {timeout}s"
@@ -163,8 +213,14 @@ def run_one(problem_id: str, model: str, env: dict, home: Path | None,
         "passed": bool(passed),
         "timed_out": timed_out,
         "seconds": seconds,
+        "turns": len(prompts),
         "tokens": (stats or {}).get("tokens"),
         "steps": (stats or {}).get("steps"),
+        "tool_calls": (stats or {}).get("toolCalls"),
+        "tool_calls_by_name": (stats or {}).get("toolCallsByName"),
+        "tool_errors": (stats or {}).get("toolErrors"),
+        "edit_errors": (stats or {}).get("editErrors"),
+        "tool_loops": (stats or {}).get("toolLoops"),
         "stderr": stderr if not passed else "",
     }
     if not keep_runs:
@@ -176,19 +232,40 @@ def summarize(results: list[dict]) -> dict:
     total = len(results)
     passed = sum(r["passed"] for r in results)
     by_diff: dict[str, dict] = {}
+    by_kind: dict[str, dict] = {}
     for r in results:
-        d = by_diff.setdefault(r["difficulty"], {"passed": 0, "total": 0})
-        d["total"] += 1
-        d["passed"] += int(r["passed"])
+        for key, bucket in (("difficulty", by_diff), ("kind", by_kind)):
+            d = bucket.setdefault(r[key], {"passed": 0, "total": 0})
+            d["total"] += 1
+            d["passed"] += int(r["passed"])
     toks = [r["tokens"] for r in results if r.get("tokens")]
     steps = [r["steps"] for r in results if r.get("steps")]
+    tool_errors = [r["tool_errors"] for r in results
+                   if r.get("tool_errors") is not None]
+    edit_errors = [r["edit_errors"] for r in results
+                   if r.get("edit_errors") is not None]
+    loops = [r["tool_loops"] for r in results
+             if r.get("tool_loops") is not None]
+    tool_calls = [r["tool_calls"] for r in results if r.get("tool_calls")]
+    # Cost-adjusted headline numbers: the thesis is "smaller CHEAPER models
+    # become viable drivers of the harness", so tokens spent per solved task
+    # matters as much as the raw pass rate.
+    total_tokens = sum(toks) if toks else None
     return {
         "passed": passed,
         "total": total,
         "rate": (passed / total) if total else 0.0,
         "by_difficulty": by_diff,
+        "by_kind": by_kind,
         "mean_tokens": round(sum(toks) / len(toks)) if toks else None,
         "mean_steps": round(sum(steps) / len(steps), 1) if steps else None,
+        "total_tokens": total_tokens,
+        "tokens_per_solve": (round(total_tokens / passed)
+                             if total_tokens and passed else None),
+        "tool_error_rate": (round(sum(tool_errors) / sum(tool_calls), 4)
+                            if tool_calls and tool_errors else None),
+        "edit_errors": sum(edit_errors) if edit_errors else 0,
+        "tool_loops": sum(loops) if loops else 0,
         "problems": results,
     }
 
@@ -205,7 +282,8 @@ def parse_args() -> argparse.Namespace:
                    help="model name the server advertises (for the config)")
     p.add_argument("--subset", default="smoke",
                    choices=["smoke", "easy", "medium", "hard", "repair",
-                            "comprehension", "all"])
+                            "comprehension", "implement", "grounding",
+                            "new", "all"])
     p.add_argument("--problems", default="",
                    help="comma-separated problem ids (overrides --subset)")
     p.add_argument("--out", type=Path, default=Path(__file__).resolve().parent,

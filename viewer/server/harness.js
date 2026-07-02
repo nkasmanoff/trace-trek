@@ -58,7 +58,6 @@ function envBlock(directory, whenMs) {
   const dateStr = date.toDateString() // e.g. "Sat Jun 20 2026"
   const isRepo = existsSync(path.join(d, '.git'))
   return [
-    'Here is some useful information about the environment you are running in:',
     '<env>',
     `  Working directory: ${d}`,
     `  Workspace root folder: ${d}`,

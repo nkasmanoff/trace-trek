@@ -52,6 +52,21 @@ LAGUNA_BASE = "poolside/Laguna-XS.2"
 # quantize Laguna's fused `LagunaExperts` module (94% of params).
 LAGUNA_FP8_BASE = "poolside/Laguna-XS.2-FP8"
 
+# Only train on trajectories produced by strong teacher models. Rows whose
+# producing model matches none of these substrings (case-insensitive) are
+# dropped by default — local-model traces (laguna, north-mini, qwen, ...) are
+# noisier and would teach the student its own bad habits. Override with
+# --allow-models (comma-separated substrings, or "all" to disable filtering).
+DEFAULT_ALLOWED_MODELS = ("big-pickle", "claude")
+
+# Fallback for rows with no "model" field (build_dataset.py's quality filter
+# strips it): the viewer's exporter labels rows by upstream provider —
+# source="frontier" for openrouter/claude teachers, source="opencode" for the
+# opencode provider (big-pickle). Local providers also land in "opencode", so
+# this mapping is a heuristic; rows exported straight from the viewer carry the
+# exact model id and never hit it.
+_MODEL_SOURCE_FALLBACK = {"big-pickle": "opencode", "claude": "frontier"}
+
 # Per-chat-format settings. `apply_chat_template(return_assistant_tokens_mask=
 # True)` is preferred for masking; the marker fields are only used as a fallback
 # when a template has no `{% generation %}` blocks (so no assistant mask).
@@ -126,6 +141,13 @@ def parse_args() -> argparse.Namespace:
                    help="when --hf-repo has only a train split, hold out this "
                         "fraction for eval")
     p.add_argument("--eval-steps", type=int, default=20)
+    p.add_argument("--allow-models", default=",".join(DEFAULT_ALLOWED_MODELS),
+                   help="comma-separated substrings of teacher model ids to "
+                        "train on (matched case-insensitively against each "
+                        "row's 'model' field, falling back to its 'source' "
+                        "label). Rows from other models are dropped. "
+                        "Pass 'all' to disable filtering. "
+                        f"Default: {','.join(DEFAULT_ALLOWED_MODELS)}")
     p.add_argument("--out", type=Path, default=Path("outputs"))
     p.add_argument("--base", default=QWEN_BASE)
     p.add_argument("--quant", choices=["auto", "fp8", "4bit", "none"],
@@ -269,6 +291,7 @@ def setup_wandb(args, fmt: str, n_train: int, n_eval: int) -> str | None:
         config={
             "base_model": args.base,
             "chat_format": fmt,
+            "allow_models": args.allow_models,
             "n_train_samples": n_train,
             "n_eval_samples": n_eval,
             "max_seq_len": args.max_seq_len,
@@ -458,18 +481,47 @@ def preflight_template(tokenizer, fmt_cfg: dict,
           f"{sum(mask)} assistant tokens OK")
 
 
+def parse_allowed_models(spec: str) -> tuple[str, ...] | None:
+    """Parse --allow-models into lowercase substrings; None = no filtering."""
+    tokens = [t.strip().lower() for t in (spec or "").split(",") if t.strip()]
+    if not tokens or "all" in tokens:
+        return None
+    return tuple(tokens)
+
+
+def model_allowed(rec: dict, allowed: tuple[str, ...] | None) -> bool:
+    """True when the record's producing model is an allowed teacher.
+
+    Prefers the row's explicit "model" id (substring match); rows without one
+    (build_dataset.py strips it) fall back to the exporter's "source" label
+    via _MODEL_SOURCE_FALLBACK."""
+    if allowed is None:
+        return True
+    model = str(rec.get("model") or "").lower()
+    if model:
+        return any(token in model for token in allowed)
+    source = str(rec.get("source") or "").lower()
+    allowed_sources = {_MODEL_SOURCE_FALLBACK[token] for token in allowed
+                       if token in _MODEL_SOURCE_FALLBACK}
+    return source in allowed_sources
+
+
 def load_samples(path: Path, tokenizer, fmt_cfg: dict, max_seq_len: int,
-                 resp_ids: list[int], end_ids: list[int]) -> "Dataset":
+                 resp_ids: list[int], end_ids: list[int],
+                 allowed_models: tuple[str, ...] | None = None) -> "Dataset":
     """Tokenize each conversation and attach an assistant-only loss mask."""
     from datasets import Dataset
 
     rows = []
-    skipped_render = skipped_long = skipped_nomask = 0
+    skipped_render = skipped_long = skipped_nomask = skipped_model = 0
     first_error: str | None = None
     for line in path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
         rec = json.loads(line)
+        if not model_allowed(rec, allowed_models):
+            skipped_model += 1
+            continue
         try:
             ids, mask = tokenize_record(rec, tokenizer, fmt_cfg,
                                         resp_ids, end_ids)
@@ -490,7 +542,10 @@ def load_samples(path: Path, tokenizer, fmt_cfg: dict, max_seq_len: int,
         rows.append({"input_ids": ids, "labels": labels})
     msg = (f"dataset: {len(rows)} samples from {path} "
            f"(skipped {skipped_render} unrenderable, {skipped_long} over "
-           f"{max_seq_len} tok, {skipped_nomask} no-assistant)")
+           f"{max_seq_len} tok, {skipped_nomask} no-assistant")
+    if allowed_models is not None:
+        msg += f", {skipped_model} non-teacher-model"
+    msg += ")"
     if first_error:
         msg += f"  [first render error: {first_error}]"
     print(msg)
@@ -1167,8 +1222,12 @@ def main() -> None:
                         add_special_tokens=False).input_ids
 
     preflight_template(tokenizer, fmt_cfg, resp_ids, end_ids)
+    allowed_models = parse_allowed_models(args.allow_models)
+    print("teacher filter: "
+          + (f"only models matching {list(allowed_models)}"
+             if allowed_models else "off (--allow-models all)"))
     dataset = load_samples(args.data, tokenizer, fmt_cfg, args.max_seq_len,
-                           resp_ids, end_ids)
+                           resp_ids, end_ids, allowed_models)
     if args.max_samples and len(dataset) > args.max_samples:
         dataset = dataset.select(range(args.max_samples))
         print(f"smoke: capped train set to {len(dataset)} samples "
@@ -1176,7 +1235,8 @@ def main() -> None:
     eval_dataset = None
     if args.eval_data and Path(args.eval_data).is_file():
         eval_dataset = load_samples(args.eval_data, tokenizer, fmt_cfg,
-                                    args.max_seq_len, resp_ids, end_ids)
+                                    args.max_seq_len, resp_ids, end_ids,
+                                    allowed_models)
 
     run_name = setup_wandb(args, fmt, len(dataset),
                            len(eval_dataset) if eval_dataset else 0)

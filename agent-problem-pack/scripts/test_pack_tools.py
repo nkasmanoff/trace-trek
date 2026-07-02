@@ -68,11 +68,14 @@ def test_prepare_excludes_hidden_tests_but_capture_injects_them(tmp_path):
     assert "tests_hidden" in verification
 
 
-def test_verify_commands_use_uv_run_pytest():
+def test_verify_commands_use_known_runners():
     tools = load_pack_tools()
 
     for problem in tools.PROBLEMS.values():
-        assert problem.verify_command[:3] == ("uv", "run", "pytest")
+        assert (
+            problem.verify_command[:3] == ("uv", "run", "pytest")
+            or problem.verify_command[:2] == ("node", "--test")
+        )
         for expected in problem.expected_behavior:
             assert "unit" + "test" not in expected
             assert "python" + "3" not in expected
@@ -131,9 +134,9 @@ def test_capture_run_accepts_pack_root_relative_run_dir(tmp_path):
 def test_all_problems_registered_with_metadata():
     tools = load_pack_tools()
 
-    assert len(tools.PROBLEMS) == 14
+    assert len(tools.PROBLEMS) == 27
     for problem in tools.PROBLEMS.values():
-        assert problem.kind in {"repair", "comprehension"}
+        assert problem.kind in {"repair", "comprehension", "implement", "grounding"}
         assert problem.difficulty in {"easy", "medium", "hard"}
         assert problem.skills
         assert (tools.PACK_ROOT / problem.identifier).is_dir()
@@ -146,12 +149,13 @@ def test_validate_pack_passes():
     tools.validate_pack(root)
 
 
-def test_golden_fixes_registered_for_all_repair_problems():
+def test_golden_fixes_registered_for_all_repair_like_problems():
     tools = load_pack_tools()
     golden = load_golden()
 
     repair_ids = {
-        pid for pid, problem in tools.PROBLEMS.items() if problem.kind == "repair"
+        pid for pid, problem in tools.PROBLEMS.items()
+        if problem.kind in tools.REPAIR_LIKE_KINDS
     }
     assert repair_ids == set(golden.GOLDEN_FILES)
 
@@ -169,10 +173,26 @@ def test_catalog_lists_all_problems():
     tools = load_pack_tools()
 
     items = tools.catalog_problems()
-    assert len(items) == 14
+    assert len(items) == 27
     assert items[0]["number"] == 1
-    assert items[-1]["number"] == 14
-    assert all(item["kind"] in {"repair", "comprehension"} for item in items)
+    assert items[-1]["number"] == 27
+    assert all(
+        item["kind"] in {"repair", "comprehension", "implement", "grounding"}
+        for item in items
+    )
+
+
+def test_multi_turn_problem_writes_turns_to_metadata(tmp_path):
+    tools = load_pack_tools()
+    root = tmp_path / "agent-problem-pack"
+    copy_pack_without_runs(root)
+
+    run_dir = tools.prepare_run(root, "problem-20-limiter-follow-ups", "turns-test")
+
+    import json
+    metadata = json.loads((run_dir / "metadata.json").read_text(encoding="utf-8"))
+    assert len(metadata["turns"]) == 2
+    assert "cost" in metadata["turns"][0]
 
 
 def test_failure_summary_from_verification():

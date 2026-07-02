@@ -63,6 +63,36 @@ Use a distinct run name per model or attempt (`codex-1`, `claude-1`, `qwen-1`, �
 | `problem-12-merge-latest-property` | Satisfy dedup invariants under property tests | repair | hard | `uv run pytest tests tests_hidden` |
 | `problem-13-persona-vector-extraction` | Explain persona-vector extraction, monitoring & steering | comprehension | hard | `uv run pytest tests` |
 | `problem-14-agent-eval-suite` | Design an eval suite for a coding agent (meta) | comprehension | hard | `uv run pytest tests` |
+| `problem-15-pipeline-bug-trace` | Weighted score bug spanning runner + aggregate | repair | hard | `uv run pytest tests tests_hidden` |
+| `problem-16-grounded-audit` | Report values only obtainable by executing the audit | grounding | hard | `uv run pytest tests` |
+| `problem-17-stage-localization` | Localize one faulty stage across 30+ modules | repair | hard | `uv run pytest tests tests_hidden` |
+| `problem-18-edit-gauntlet` | Precisely fix 3 of 6 near-identical handlers | repair | hard | `uv run pytest tests tests_hidden` |
+| `problem-19-follow-the-pattern` | Add a service following framework conventions | implement | hard | `uv run pytest tests tests_hidden` |
+| `problem-20-limiter-follow-ups` | Fix limiter, then extend API over follow-up turns | repair | hard | `uv run pytest tests tests_hidden` |
+| `problem-21-js-eval-aggregate` | Repair JS eval aggregation + flip detection | repair | hard | `node --test tests/*.test.js tests_hidden/*.test.js` |
+| `problem-22-implement-jsonl-support` | Terse commit-style request: "jsonl support" | implement | hard | `uv run pytest tests tests_hidden` |
+| `problem-23-implement-retry-backoff` | Terse commit-style request: retry with backoff | implement | hard | `uv run pytest tests tests_hidden` |
+| `problem-24-implement-dry-run` | Terse commit-style request: "add --dry-run" | implement | hard | `uv run pytest tests tests_hidden` |
+| `problem-25-implement-parse-lineno` | Terse request: line numbers in parse errors (exact contract in docstring) | implement | hard | `uv run pytest tests tests_hidden` |
+| `problem-26-lru-pin-revision` | Repair pinnable LRU cache to its full documented contract | repair | hard | `uv run pytest tests tests_hidden` |
+| `problem-27-implement-rates-section` | Terse request: add report rates section per docs spec | implement | hard | `uv run pytest tests tests_hidden` |
+
+### Task kinds
+
+- **repair** — failing tests; diagnose and fix with a minimal change.
+- **comprehension** — read source, explain in `AGENT_FINAL_ANSWER.md`; graded by concept checks.
+- **implement** — a terse, commit-message-style change request. Visible tests pass at
+  baseline; grading tests are hidden, so there is no feedback loop for the new
+  behavior — the agent must recover the intended contract from repo conventions,
+  docstrings, and READMEs (mirrors the "implement the following change" tasks in
+  the opencode SFT traces).
+- **grounding** — the answer must contain values (a hash token, counts) only
+  obtainable by actually running code in the workspace. Discriminates agents that
+  execute from agents that hallucinate plausible output.
+
+Multi-turn problems (e.g. `problem-20`) declare follow-up `turns`; harnesses
+deliver them with `opencode run --continue` (see `pipeline/eval/run_problem_pack.py`).
+Final grading covers all turns.
 
 ### Hidden tests
 

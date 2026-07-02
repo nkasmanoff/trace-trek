@@ -107,6 +107,40 @@ function runSync(cmd, opts = {}) {
   })
 }
 
+// Provider API keys (e.g. OPENROUTER_API_KEY) usually live in the user's shell
+// rc, not in this dev server's environment: when vite is launched outside a
+// login shell (app launcher, IDE task) those vars are absent, opencode finds no
+// credential for env-keyed providers, and every agent dies at the first request
+// with an opaque "Unexpected server error". Backfill missing keys from a login
+// shell once and reuse them for all spawns.
+const PROVIDER_ENV_KEYS = [
+  'OPENROUTER_API_KEY',
+  'MODAL_PROXY_AUTH_TOKEN_ID',
+  'MODAL_PROXY_AUTH_TOKEN_SECRET',
+]
+let _providerEnvCache = null
+function providerEnv() {
+  if (_providerEnvCache) return _providerEnvCache
+  const env = { ...process.env }
+  const missing = PROVIDER_ENV_KEYS.filter(k => !env[k])
+  if (missing.length) {
+    try {
+      // `env -0` NUL-delimits entries so values survive rc-file noise/newlines.
+      const out = execFileSync('/bin/zsh', ['-ilc', 'command env -0'], {
+        encoding: 'utf-8', timeout: 15000, stdio: ['ignore', 'pipe', 'ignore'],
+      })
+      for (const entry of out.split('\x00')) {
+        const eq = entry.indexOf('=')
+        if (eq === -1) continue
+        const key = entry.slice(0, eq)
+        if (missing.includes(key)) env[key] = entry.slice(eq + 1)
+      }
+    } catch {}
+  }
+  _providerEnvCache = env
+  return env
+}
+
 // Valid opencode model ids ("provider/model"). Cached so we only shell out once.
 let _modelCache = null
 function listOpencodeModels() {
@@ -380,19 +414,26 @@ export function startRun(requestedModel, problemIds) {
       const realWs = fs.realpathSync(ws)
 
       const meta = catalog[prob.id]
-      const prompt = meta?.task_prompt
-        ? `${meta.task_prompt}\n\nAt the end, write your concise final answer to AGENT_FINAL_ANSWER.md in this workspace.`
-        : null
-      if (!prompt) throw new Error(`no prompt defined for ${prob.id}`)
+      if (!meta?.task_prompt) throw new Error(`no prompt defined for ${prob.id}`)
+      // Multi-turn problems (metadata `turns`) get their follow-up prompts as
+      // separate `opencode run --continue` invocations in the same workspace,
+      // mirroring run_problem_pack.py. The final-answer instruction rides on
+      // the last turn so the agent doesn't write it prematurely.
+      const prompts = [meta.task_prompt, ...(meta.turns || [])]
+      prompts[prompts.length - 1] +=
+        '\n\nAt the end, write your concise final answer to AGENT_FINAL_ANSWER.md in this workspace.'
+      prob.turns = prompts.length
 
       const opencodeStdoutPath = path.join(tmpBase, String(prob.number) + '-stdout.log')
       const opencodeStderrPath = path.join(tmpBase, String(prob.number) + '-stderr.log')
 
       const advance = () => { idx++; process.nextTick(nextProblem) }
 
-      const launchAgent = (attempt) => {
-      const opencodeStdout = fs.openSync(opencodeStdoutPath, 'w')
-      const opencodeStderr = fs.openSync(opencodeStderrPath, 'w')
+      const launchAgent = (turnIndex, attempt) => {
+      // First turn truncates the logs; later turns/attempts append.
+      const logFlags = turnIndex === 0 && attempt === 1 ? 'w' : 'a'
+      const opencodeStdout = fs.openSync(opencodeStdoutPath, logFlags)
+      const opencodeStderr = fs.openSync(opencodeStderrPath, logFlags)
 
       // NOTE: do NOT run this through a shell. With `shell: '/bin/bash'` plus an
       // args array, Node collapses everything into a single `bash -c "..."`
@@ -404,11 +445,12 @@ export function startRun(requestedModel, problemIds) {
         '--model', model,
         '--dangerously-skip-permissions',
         '--dir', realWs,
-        prompt,
+        ...(turnIndex > 0 ? ['--continue'] : []),
+        prompts[turnIndex],
       ], {
         cwd: realWs,
         stdio: ['ignore', opencodeStdout, opencodeStderr],
-        env: { ...process.env, HOME: process.env.HOME },
+        env: providerEnv(),
         detached: true,
       })
       opencodeProc.unref()
@@ -424,13 +466,19 @@ export function startRun(requestedModel, problemIds) {
         // than recording a spurious failure (see MAX_AGENT_ATTEMPTS note above).
         const lockFailed = /database is locked/i.test(prob.stderr || '')
         if (lockFailed && attempt < MAX_AGENT_ATTEMPTS) {
-          prob.retries = attempt
+          prob.retries = (prob.retries || 0) + 1
           prob.status = 'running'
           upsertRun(run)
-          setTimeout(() => launchAgent(attempt + 1), 1000 * attempt + Math.floor(Math.random() * 500))
+          setTimeout(() => launchAgent(turnIndex, attempt + 1), 1000 * attempt + Math.floor(Math.random() * 500))
           return
         }
-        if (attempt > 1) prob.retries = attempt - 1
+
+        // More user turns to deliver: continue the same session before grading.
+        if (turnIndex + 1 < prompts.length) {
+          upsertRun(run)
+          launchAgent(turnIndex + 1, 1)
+          return
+        }
 
         const ver = verifyProblem(prob.id, realWs)
         prob.passed = ver.passed
@@ -488,7 +536,7 @@ export function startRun(requestedModel, problemIds) {
       })
       }
 
-      launchAgent(1)
+      launchAgent(0, 1)
     } catch (err) {
       prob.status = 'error'
       prob.output = err.message

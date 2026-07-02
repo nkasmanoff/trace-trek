@@ -23,6 +23,22 @@ class Problem:
     verify_command: tuple[str, ...]
     task_prompt: str
     expected_behavior: tuple[str, ...]
+    # Follow-up user turns delivered after task_prompt (multi-turn problems).
+    turns: tuple[str, ...] = ()
+
+
+# Kinds that must have a failing baseline and a registered golden fix.
+# - repair:    diagnose failing tests, fix the code
+# - implement: terse change request (commit-message style); grading is done by
+#              hidden tests only, so the agent gets no visible feedback loop
+#              for the new behavior and must infer intent from repo conventions
+REPAIR_LIKE_KINDS = {"repair", "implement"}
+
+# Kinds graded by checks on the agent's written/reported output.
+# - comprehension: concept checks on AGENT_FINAL_ANSWER.md
+# - grounding:     answer must contain values only obtainable by actually
+#                  executing code in the workspace (anti-hallucination)
+ANSWER_KINDS = {"comprehension", "grounding"}
 
 
 PROBLEMS = {
@@ -297,6 +313,281 @@ PROBLEMS = {
             "All tests in tests/test_answer.py should pass with uv run pytest tests.",
         ),
     ),
+    "problem-15-pipeline-bug-trace": Problem(
+        identifier="problem-15-pipeline-bug-trace",
+        title="Weighted Pipeline Score Repair",
+        kind="repair",
+        difficulty="hard",
+        skills=("multi-file", "data-pipeline", "debugging", "edge-cases"),
+        verify_command=("uv", "run", "pytest", "tests", "tests_hidden"),
+        task_prompt=(
+            "The eval pipeline in src/pipeline/ (dataset -> runner -> aggregate -> report) "
+            "reports a wrong weighted suite score. Read the module docstrings, which specify "
+            "the weighting contract, then make the smallest set of changes so the whole "
+            "pipeline honors it. The bug is not confined to one stage. Explain each root "
+            "cause and where you fixed it."
+        ),
+        expected_behavior=(
+            "The agent should recover the weight contract from the docstrings: weighted mean over positive-weight tasks, weight 0.0 excluded but recorded.",
+            "The runner must stop coercing an explicit weight of 0.0 to 1.0 (task.get('weight') or 1.0).",
+            "The aggregate must divide by the sum of positive weights, not the record count, and exclude zero-weight tasks from the numerator.",
+            "The fix should span runner.py and aggregate.py; patching only one stage still fails hidden tests.",
+            "All tests pass with uv run pytest tests tests_hidden, including hidden property tests.",
+        ),
+    ),
+    "problem-16-grounded-audit": Problem(
+        identifier="problem-16-grounded-audit",
+        title="Grounded Execution Audit",
+        kind="grounding",
+        difficulty="hard",
+        skills=("execution", "cli", "grounding", "reporting"),
+        verify_command=("uv", "run", "pytest", "tests"),
+        task_prompt=(
+            "Run the event-log audit at source/audit.py in STRICT mode and report its "
+            "findings. Your final answer must state exactly: the AUDIT_TOKEN, the number "
+            "of valid records, the top category, and the mean latency in ms rounded to "
+            "one decimal place — all as produced by the strict-mode audit. Do not guess "
+            "or estimate any value; every number must come from actually running the audit. "
+            "Write your answer to AGENT_FINAL_ANSWER.md."
+        ),
+        expected_behavior=(
+            "The agent should execute source/audit.py with the --strict flag (not just read the code or run the default mode).",
+            "The answer must contain the strict-mode AUDIT_TOKEN, which is a hash over the selected record ids and cannot be produced without execution.",
+            "The answer must contain the strict-mode valid record count, top category, and mean latency (one decimal).",
+            "Reporting default-mode numbers indicates the agent ran the wrong command; fabricated numbers indicate hallucination.",
+            "All tests in tests/test_answer.py should pass with uv run pytest tests.",
+        ),
+    ),
+    "problem-17-stage-localization": Problem(
+        identifier="problem-17-stage-localization",
+        title="Pipeline Stage Fault Localization",
+        kind="repair",
+        difficulty="hard",
+        skills=("fault-localization", "code-search", "multi-file", "debugging"),
+        verify_command=("uv", "run", "pytest", "tests", "tests_hidden"),
+        task_prompt=(
+            "An integration test for the flowkit pipeline fails: the 'smooth' stage "
+            "produces wrong output. The package has many modules and more than one "
+            "windowing implementation; find the stage implementation the pipeline "
+            "actually uses, fix the real bug with the smallest change, and do not "
+            "touch code that is working. Explain how you located the faulty function."
+        ),
+        expected_behavior=(
+            "The agent should trace the stage registry to src/flowkit/transforms/windows.py rather than guessing from file names.",
+            "The fix should change rolling_mean in transforms/windows.py to the documented trailing window (mean of values[max(0, i-window+1):i+1]).",
+            "The correct rolling_mean in stats/window_stats.py must not be modified or rewired into the registry.",
+            "The integration test must pass without editing tests.",
+            "All tests pass with uv run pytest tests tests_hidden, including hidden unit tests pinning the fix to the right module.",
+        ),
+    ),
+    "problem-18-edit-gauntlet": Problem(
+        identifier="problem-18-edit-gauntlet",
+        title="Handler Table Precision Edits",
+        kind="repair",
+        difficulty="hard",
+        skills=("precise-editing", "code-reading", "edge-cases"),
+        verify_command=("uv", "run", "pytest", "tests", "tests_hidden"),
+        task_prompt=(
+            "Three of the six event handlers in src/handlers.py violate the contract "
+            "documented at the top of the file; the other three are correct. The "
+            "handlers are nearly identical, so be precise: fix exactly the broken "
+            "ones and leave the correct ones byte-for-byte untouched. State which "
+            "handlers were broken and why."
+        ),
+        expected_behavior=(
+            "The agent should identify the three broken handlers: log (wrong payload key), trace (boundary excludes the limit), alert (ttl wrongly decremented).",
+            "Each fix should be a minimal targeted edit in the right handler.",
+            "The three correct handlers (metric, audit, heartbeat) must remain unchanged; blanket find/replace edits break them.",
+            "All tests pass with uv run pytest tests tests_hidden, including hidden collateral-damage tests.",
+        ),
+    ),
+    "problem-19-follow-the-pattern": Problem(
+        identifier="problem-19-follow-the-pattern",
+        title="Implement a Service Following Conventions",
+        kind="implement",
+        difficulty="hard",
+        skills=("pattern-following", "code-reading", "implementation"),
+        verify_command=("uv", "run", "pytest", "tests", "tests_hidden"),
+        task_prompt=(
+            "Implement the following change in this repository: add a line-stats "
+            "service. Given {\"text\": str} it reports the number of non-empty lines, "
+            "the number of whitespace-separated words, and the number of distinct "
+            "words compared case-insensitively, as {\"lines\": int, \"words\": int, "
+            "\"unique_words\": int}. Its public name is \"line-stats\". Follow the "
+            "existing service conventions exactly — the framework and the current "
+            "services define everything else you need to know."
+        ),
+        expected_behavior=(
+            "The agent should read base.py and the existing services to recover the conventions before writing code.",
+            "The new service should subclass BaseService, declare name 'line-stats' and schema {'text': str}, and implement only _process.",
+            "The service module must be imported from src/services/__init__.py or it never registers.",
+            "Validation errors must surface as ServiceInputError via the base class, not ad-hoc raises.",
+            "All tests pass with uv run pytest tests tests_hidden; the grading tests are hidden, so conventions must be followed without a feedback loop.",
+        ),
+    ),
+    "problem-20-limiter-follow-ups": Problem(
+        identifier="problem-20-limiter-follow-ups",
+        title="Rate Limiter Fix with Follow-Up Turns",
+        kind="repair",
+        difficulty="hard",
+        skills=("debugging", "multi-turn", "api-design"),
+        verify_command=("uv", "run", "pytest", "tests", "tests_hidden"),
+        task_prompt=(
+            "A token-bucket rate limiter test fails: an idle bucket accumulates "
+            "tokens past its capacity. Diagnose and fix the bug in src/limiter.py "
+            "with the smallest safe change."
+        ),
+        turns=(
+            "Now extend the limiter API: allow() should accept a cost parameter "
+            "(defaulting to 1) so a single request can spend several tokens — a "
+            "request that cannot be paid in full is denied and spends nothing — and "
+            "add a remaining() method that refills and then returns the current "
+            "token count.",
+            "Finally, in AGENT_FINAL_ANSWER.md, explain the original bug in one "
+            "or two sentences and document the final public API of TokenBucket.",
+        ),
+        expected_behavior=(
+            "Turn 1: the refill must clamp tokens at capacity (min(capacity, tokens + elapsed * rate)).",
+            "Turn 2: allow(cost=1) spends cost tokens atomically; a denied request spends nothing; remaining() refills then reports tokens.",
+            "The follow-up API must not break the original single-token behavior.",
+            "Turn 3: AGENT_FINAL_ANSWER.md explains the bug and documents the API.",
+            "All tests pass with uv run pytest tests tests_hidden; the follow-up API is graded by hidden tests.",
+        ),
+    ),
+    "problem-21-js-eval-aggregate": Problem(
+        identifier="problem-21-js-eval-aggregate",
+        title="JS Eval Aggregation Repair",
+        kind="repair",
+        difficulty="hard",
+        skills=("javascript", "data-aggregation", "debugging", "edge-cases"),
+        verify_command=("node", "--test", "tests/*.test.js", "tests_hidden/*.test.js"),
+        task_prompt=(
+            "This JavaScript module (src/aggregate.js) aggregates eval results and "
+            "detects run-to-run regressions. Tests fail (run them with: node --test "
+            "tests). Read the contract in the module's JSDoc header — skipped "
+            "records (passed === null) have precise semantics — and fix the module "
+            "so the full contract holds. Explain the root causes."
+        ),
+        expected_behavior=(
+            "The agent should run node --test to see the failures and read the JSDoc contract.",
+            "aggregateEval must exclude passed === null records from total, passed, passRate, and meanScore.",
+            "findFlips must require an actual pass in base and an explicit fail (passed === false) in candidate; skipped or missing records are not flips.",
+            "All tests pass with node --test tests/*.test.js tests_hidden/*.test.js, including hidden edge cases.",
+        ),
+    ),
+    "problem-22-implement-jsonl-support": Problem(
+        identifier="problem-22-implement-jsonl-support",
+        title="Implement: JSONL Support",
+        kind="implement",
+        difficulty="hard",
+        skills=("implementation", "conventions", "error-handling"),
+        verify_command=("uv", "run", "pytest", "tests", "tests_hidden"),
+        task_prompt=(
+            "Implement the following change in this repository: jsonl support"
+        ),
+        expected_behavior=(
+            "The agent should read src/datakit/loaders.py and errors.py to recover the loader conventions (EXT_LOADERS registry, RecordParseError semantics).",
+            "A .jsonl loader must be registered in EXT_LOADERS and parse one JSON record per line.",
+            "Blank lines must be skipped; a malformed line must raise RecordParseError whose message includes the path and the 1-based line number.",
+            "Existing .json behavior must be unchanged.",
+            "All tests pass with uv run pytest tests tests_hidden; the grading tests are hidden.",
+        ),
+    ),
+    "problem-23-implement-retry-backoff": Problem(
+        identifier="problem-23-implement-retry-backoff",
+        title="Implement: Retry with Exponential Backoff",
+        kind="implement",
+        difficulty="hard",
+        skills=("implementation", "conventions", "resilience"),
+        verify_command=("uv", "run", "pytest", "tests", "tests_hidden"),
+        task_prompt=(
+            "Implement the following change in this repository: retry transient "
+            "failures with exponential backoff"
+        ),
+        expected_behavior=(
+            "The agent should recover the contract from config.py (MAX_ATTEMPTS is total attempts, BACKOFF_BASE doubles per retry) and errors.py (only TransientError is retryable).",
+            "ApiClient.send must retry TransientError up to MAX_ATTEMPTS total attempts, sleeping BACKOFF_BASE then doubling between attempts.",
+            "Non-transient ApiError must not be retried; the success path must not sleep.",
+            "After MAX_ATTEMPTS transient failures the last TransientError propagates.",
+            "All tests pass with uv run pytest tests tests_hidden; the grading tests are hidden and measure real call counts and delays.",
+        ),
+    ),
+    "problem-24-implement-dry-run": Problem(
+        identifier="problem-24-implement-dry-run",
+        title="Implement: Cleanup --dry-run Flag",
+        kind="implement",
+        difficulty="hard",
+        skills=("implementation", "cli", "conventions"),
+        verify_command=("uv", "run", "pytest", "tests", "tests_hidden"),
+        task_prompt=(
+            "Implement the following change in this repository: add --dry-run"
+        ),
+        expected_behavior=(
+            "The agent should find the roadmap contract in README.md: --dry-run prints 'would delete <path>' per candidate, deletes nothing, exits 0.",
+            "Selection and ordering must match a real run (the policy's sorted candidates).",
+            "The real (non-dry-run) path must keep deleting and printing 'deleted <path>'.",
+            "The flag must be wired through the argparse CLI in src/janitor/cli.py.",
+            "All tests pass with uv run pytest tests tests_hidden; the grading tests are hidden.",
+        ),
+    ),
+    "problem-25-implement-parse-lineno": Problem(
+        identifier="problem-25-implement-parse-lineno",
+        title="Implement: Parse Errors with Line Numbers",
+        kind="implement",
+        difficulty="hard",
+        skills=("implementation", "conventions", "error-handling"),
+        verify_command=("uv", "run", "pytest", "tests", "tests_hidden"),
+        task_prompt=(
+            "Implement the following change in this repository: report line "
+            "numbers in parse errors"
+        ),
+        expected_behavior=(
+            "The agent should recover the contract from src/logkit/errors.py: 1-based line numbers counting every physical line, str(error) exactly 'line {lineno}: {reason}', int lineno attribute, bare reason attribute, first invalid line wins.",
+            "ParseError construction and the parser's raise sites must both change consistently.",
+            "Existing parsing behavior (blank/comment skipping, last-assignment-wins, value whitespace handling) must not regress.",
+            "All tests pass with uv run pytest tests tests_hidden; the grading tests are hidden and check the exact contract.",
+        ),
+    ),
+    "problem-26-lru-pin-revision": Problem(
+        identifier="problem-26-lru-pin-revision",
+        title="LRU Cache Pinning Contract Repair",
+        kind="repair",
+        difficulty="hard",
+        skills=("debugging", "invariants", "data-structures"),
+        verify_command=("uv", "run", "pytest", "tests", "tests_hidden"),
+        task_prompt=(
+            "The pinnable LRU cache in src/lrupin.py violates its documented "
+            "contract: a visible test shows a pinned entry being evicted. Read "
+            "the class docstring, find every place the implementation deviates "
+            "from the contract, and fix them with minimal changes."
+        ),
+        expected_behavior=(
+            "The agent should fix eviction to skip pinned keys and take the least recently used unpinned key.",
+            "put() overwriting an existing key must never evict (the buggy code evicts before checking membership).",
+            "Inserting into a fully pinned cache must raise RuntimeError('all entries pinned') and leave the cache unchanged.",
+            "Recency semantics (get refreshes, pin/unpin do not) must be preserved.",
+            "All tests pass with uv run pytest tests tests_hidden; hidden tests grade the full contract.",
+        ),
+    ),
+    "problem-27-implement-rates-section": Problem(
+        identifier="problem-27-implement-rates-section",
+        title="Implement: Report Rates Section",
+        kind="implement",
+        difficulty="hard",
+        skills=("implementation", "conventions", "formatting"),
+        verify_command=("uv", "run", "pytest", "tests", "tests_hidden"),
+        task_prompt=(
+            "Implement the following change in this repository: add the rates "
+            "section to the summary report"
+        ),
+        expected_behavior=(
+            "The agent should find the spec in docs/REPORT_FORMAT.md and follow the section conventions in src/reportkit/sections.py.",
+            "A section_rates function must be registered in SECTIONS immediately after counts.",
+            "Rates are computed over non-skip records; unknown statuses count as errors; formatting is exactly one decimal plus '%'.",
+            "With zero attempted records both lines must read 'n/a'.",
+            "All tests pass with uv run pytest tests tests_hidden; hidden tests grade exact output strings and registration order.",
+        ),
+    ),
     "problem-14-agent-eval-suite": Problem(
         identifier="problem-14-agent-eval-suite",
         title="Meta: Design an Agent Eval Suite",
@@ -420,6 +711,7 @@ def write_run_metadata(run_dir, problem, run_name):
         "skills": list(problem.skills),
         "run_name": run_name,
         "verify_command": list(problem.verify_command),
+        "turns": list(problem.turns),
     }
     (run_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
 
@@ -591,6 +883,7 @@ def catalog_problems():
                 "skills": list(problem.skills),
                 "verify_command": list(problem.verify_command),
                 "task_prompt": problem.task_prompt,
+                "turns": list(problem.turns),
             }
         )
     return sorted(items, key=lambda item: item["number"])
@@ -682,7 +975,7 @@ def validate_problem(root, problem):
     if not source.is_dir():
         raise FileNotFoundError(f"missing problem directory: {source}")
 
-    if problem.kind == "comprehension":
+    if problem.kind in ANSWER_KINDS:
         required = ["source", "tests"]
         missing = [name for name in required if not (source / name).is_dir()]
         if missing:
@@ -690,8 +983,9 @@ def validate_problem(root, problem):
         return
 
     baseline = run_command(problem.verify_command, source)
-    failures = count_pytest_failures(baseline)
-    if failures == 0:
+    # Non-pytest verifiers (e.g. node --test) don't print "N failed"; a
+    # failing baseline is a nonzero exit either way.
+    if baseline.returncode == 0 and count_pytest_failures(baseline) == 0:
         raise AssertionError(f"{problem.identifier}: expected failing baseline tests, got 0 failures")
 
     if problem.identifier not in GOLDEN_FILES:
