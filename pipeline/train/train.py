@@ -875,37 +875,17 @@ def load_lora(args, fmt: str):
 
 
 def pull_hf_dataset(args) -> tuple[Path, Path]:
-    """Pull a HF dataset to out/sft.jsonl (+ sft-eval.jsonl). Datasets that
-    ship only a train split are deterministically split via --eval-frac."""
-    from datasets import load_dataset
+    """Pull a HF dataset to out/sft.jsonl (+ sft-eval.jsonl), running
+    pull_dataset.py's cleaning pass (benchmark decontamination + teacher
+    identity sanitize to --base) so a stale HF snapshot can't poison a run.
+    Datasets that ship only a train split are split via --eval-frac."""
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from pull_dataset import pull_split_clean
 
     print(f"Pulling dataset from HF: {args.hf_repo}...")
-    ds = load_dataset(args.hf_repo)
-    eval_key = next((k for k in ("eval", "test", "validation") if k in ds), None)
-    if eval_key:
-        train_split, eval_split = ds["train"], ds[eval_key]
-        print(f"  using existing splits: train + {eval_key}")
-    else:
-        parts = ds["train"].train_test_split(test_size=args.eval_frac, seed=0)
-        train_split, eval_split = parts["train"], parts["test"]
-        print(f"  split train into {len(train_split)}/{len(eval_split)} "
-              f"(eval_frac={args.eval_frac})")
-
-    data_path = args.out / "sft.jsonl"
-    eval_path = args.out / "sft-eval.jsonl"
-    for split, out_path in ((train_split, data_path), (eval_split, eval_path)):
-        with out_path.open("w") as f:
-            for row in split:
-                row = dict(row)
-                # some repos store tools as a JSON string; normalize to a list
-                if isinstance(row.get("tools"), str):
-                    try:
-                        row["tools"] = json.loads(row["tools"])
-                    except (json.JSONDecodeError, TypeError):
-                        pass
-                f.write(json.dumps(row) + "\n")
-        print(f"  wrote {len(split)} samples -> {out_path}")
-    return data_path, eval_path
+    return pull_split_clean(args.hf_repo, args.out, args.eval_frac,
+                            model_name=args.base)
 
 
 def _write_opencode_config(out_dir: Path, base_url: str, model_id: str) -> Path:

@@ -1,24 +1,74 @@
 #!/usr/bin/env python3
-"""Pull an SFT dataset from HF Hub and split it into train/eval JSONL files.
+"""Pull an SFT dataset from HF Hub, CLEAN it, and split into train/eval JSONL.
 
 `nkasmanoff/opencode-sft` ships a single `train` split (~500 opencode
 sessions), so we deterministically hold out --eval-frac of it for evaluation.
 The eval split is also what eval/harvest_eval_tasks.py turns into held-out
 opencode-harness tasks, so the same rows are never trained on and evaluated.
 
+Every pull is scrubbed through build_dataset.py's cleaning steps so a stale or
+dirty HF snapshot can never poison a training run:
+
+  1. decontaminate — drop rows overlapping the held-out agent-problem-pack:
+     build_dataset's n-gram index over the pack sources PLUS the pack's
+     check_contamination marker gate. Needs the repo clone's
+     agent-problem-pack/ next to pipeline/ (present on any pod that cloned the
+     repo); a missing pack only warns loudly. --no-decontam skips both.
+  2. sanitize — rewrite the teacher model identity in system prompts (e.g.
+     "You are powered by the model named north-mini-code") to the model being
+     trained (--model-name, default Qwen3.6) and normalize worktree paths, so
+     the student is never taught to claim it is a previous training target.
+
 Usage on the pod:
     export HF_TOKEN=...read-only-token...   # only needed for private repos
     python train/pull_dataset.py [--repo nkasmanoff/opencode-sft] \
-        [--out dataset] [--eval-frac 0.1]
+        [--out dataset] [--eval-frac 0.1] [--model-name Qwen/Qwen3.6-35B-A3B]
 """
 import argparse
 import copy
 import json
+import random
+import sys
 from pathlib import Path
 
-from datasets import load_dataset
+from huggingface_hub import hf_hub_download, list_repo_files
 
-LAGUNA_BASE = "poolside/Laguna-XS.2"
+QWEN_BASE = "Qwen/Qwen3.6-35B-A3B"
+
+TRAIN_FILES = ("sft.jsonl", "train.jsonl", "data/train.jsonl")
+EVAL_FILES = ("sft-eval.jsonl", "eval.jsonl", "test.jsonl", "validation.jsonl")
+
+
+def _build_dataset_module():
+    """Import pipeline/dataset/build_dataset.py (decontaminate + sanitize)."""
+    dataset_dir = Path(__file__).resolve().parent.parent / "dataset"
+    if str(dataset_dir) not in sys.path:
+        sys.path.insert(0, str(dataset_dir))
+    import build_dataset
+    return build_dataset
+
+
+def drop_marker_hits(rows: list[dict], pack_root: Path) -> list[dict]:
+    """Apply the pack's check_contamination marker gate on top of the n-gram
+    decontam: it catches traces that *discuss* a problem (symbol names, prompt
+    phrases) without quoting 13 contiguous tokens of its source."""
+    scripts_dir = Path(pack_root) / "scripts"
+    if not (scripts_dir / "check_contamination.py").is_file():
+        print(f"  markers: SKIPPED — {scripts_dir}/check_contamination.py "
+              f"not found", file=sys.stderr)
+        return rows
+    if str(scripts_dir) not in sys.path:
+        sys.path.insert(0, str(scripts_dir))
+    from check_contamination import scan_row
+    kept, dropped = [], 0
+    for row in rows:
+        if scan_row(json.dumps(row)):
+            dropped += 1
+        else:
+            kept.append(row)
+    print(f"  markers: kept {len(kept)}, dropped {dropped} "
+          f"(check_contamination gate)")
+    return kept
 
 
 def normalize_tool_args(messages):
@@ -36,17 +86,101 @@ def normalize_tool_args(messages):
     return msgs
 
 
-def write_split(split, out_path: Path) -> int:
-    with out_path.open("w") as f:
-        for row in split:
-            row = dict(row)
+def read_jsonl(path: Path) -> list[dict]:
+    """Read raw JSONL rows with tools normalized to lists. We fetch the raw
+    file instead of using `datasets.load_dataset` because the rows have
+    heterogeneous message schemas that Arrow refuses to cast (and would
+    None-fill even when it succeeds)."""
+    rows = []
+    with path.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
             if isinstance(row.get("tools"), str):
                 try:
                     row["tools"] = json.loads(row["tools"])
                 except (json.JSONDecodeError, TypeError):
                     pass
+            rows.append(row)
+    return rows
+
+
+def fetch_repo_rows(repo: str) -> tuple[list[dict], list[dict] | None]:
+    """Download the dataset's raw JSONL from HF. Returns (train, eval-or-None)."""
+    names = set(list_repo_files(repo, repo_type="dataset"))
+    train_name = next((n for n in TRAIN_FILES if n in names), None)
+    if train_name is None:
+        jsonls = sorted(n for n in names if n.endswith(".jsonl"))
+        if not jsonls:
+            raise SystemExit(f"no .jsonl files found in {repo}: {sorted(names)}")
+        train_name = jsonls[0]
+    train_rows = read_jsonl(Path(hf_hub_download(
+        repo, train_name, repo_type="dataset")))
+    eval_name = next((n for n in EVAL_FILES if n in names), None)
+    eval_rows = None
+    if eval_name:
+        eval_rows = read_jsonl(Path(hf_hub_download(
+            repo, eval_name, repo_type="dataset")))
+    print(f"  pulled {train_name} ({len(train_rows)} rows)"
+          + (f" + {eval_name} ({len(eval_rows)} rows)" if eval_name else ""))
+    return train_rows, eval_rows
+
+
+def clean_rows(rows: list[dict], model_name: str, workspace: str = "/workspace",
+               pack_root: Path | None = None, decontam: bool = True,
+               decontam_ngram: int = 13, do_sanitize: bool = True) -> list[dict]:
+    """Benchmark-decontaminate and identity-sanitize pulled rows in one pass."""
+    bd = _build_dataset_module()
+    root = (pack_root or bd.DEFAULT_PACK_ROOT) if decontam else None
+    rows = bd.decontaminate(rows, root, n=decontam_ngram)
+    if root is not None and Path(root).is_dir():
+        rows = drop_marker_hits(rows, Path(root))
+    if do_sanitize:
+        rows = bd.sanitize(rows, model_name, workspace)
+    return rows
+
+
+def write_split(rows: list[dict], out_path: Path) -> int:
+    with out_path.open("w") as f:
+        for row in rows:
             f.write(json.dumps(row) + "\n")
-    return len(split)
+    return len(rows)
+
+
+def pull_split_clean(repo: str, out: Path, eval_frac: float, model_name: str,
+                     workspace: str = "/workspace",
+                     pack_root: Path | None = None, decontam: bool = True,
+                     decontam_ngram: int = 13, do_sanitize: bool = True,
+                     ) -> tuple[Path, Path]:
+    """Pull `repo`, clean it, and write out/sft.jsonl + out/sft-eval.jsonl.
+    Also used by train.py --hf-repo so both download paths stay clean."""
+    print(f"Loading {repo}...")
+    train_rows, eval_rows = fetch_repo_rows(repo)
+    if eval_rows is not None:
+        print("  using existing train + eval splits")
+        train_rows = clean_rows(train_rows, model_name, workspace,
+                                pack_root, decontam, decontam_ngram, do_sanitize)
+        eval_rows = clean_rows(eval_rows, model_name, workspace,
+                               pack_root, decontam, decontam_ngram, do_sanitize)
+    else:
+        # Clean BEFORE splitting so decontam-dropped rows can't skew the split.
+        rows = clean_rows(train_rows, model_name, workspace,
+                          pack_root, decontam, decontam_ngram, do_sanitize)
+        indices = list(range(len(rows)))
+        random.Random(0).shuffle(indices)
+        n_eval = max(1, round(len(rows) * eval_frac)) if rows else 0
+        eval_idx = set(indices[:n_eval])
+        train_rows = [r for i, r in enumerate(rows) if i not in eval_idx]
+        eval_rows = [r for i, r in enumerate(rows) if i in eval_idx]
+        print(f"  split single train file with eval_frac={eval_frac} (seed 0)")
+
+    out.mkdir(parents=True, exist_ok=True)
+    data_path, eval_path = out / "sft.jsonl", out / "sft-eval.jsonl"
+    print(f"  train: {write_split(train_rows, data_path)} -> {data_path}")
+    print(f"  eval:  {write_split(eval_rows, eval_path)} -> {eval_path}")
+    return data_path, eval_path
 
 
 def sanity_check(sample: dict, base: str) -> None:
@@ -73,7 +207,11 @@ def sanity_check(sample: dict, base: str) -> None:
         print(f"  reasoning renders: {'<think>' in text}  "
               f"tool calls render: {'<tool_call>' in text}")
         if n_asst == 0:
-            print("  WARNING: no assistant tokens masked — check the template")
+            # Qwen-style templates ship no {% generation %} blocks; train.py
+            # falls back to marker-based masking for those, so this is only a
+            # hard failure for templates that are supposed to emit the mask.
+            print("  note: template emits no assistant mask "
+                  "(train.py uses marker-based masking for such templates)")
         else:
             print("  Sanity check passed.")
     except Exception as e:  # noqa: BLE001
@@ -85,28 +223,36 @@ def main():
     p.add_argument("--repo", default="nkasmanoff/opencode-sft")
     p.add_argument("--out", type=Path, default=Path("dataset"))
     p.add_argument("--eval-frac", type=float, default=0.1)
-    p.add_argument("--base", default=LAGUNA_BASE,
+    p.add_argument("--base", default=QWEN_BASE,
                    help="model id used for the rendering sanity check")
+    p.add_argument("--model-name", default=None,
+                   help="rewrite the teacher model identity in system prompts "
+                        "to this id (default: --base)")
+    p.add_argument("--workspace-path", default="/workspace",
+                   help="stable workspace root substituted for replay "
+                        "worktree paths during sanitize")
+    p.add_argument("--no-sanitize", action="store_true",
+                   help="keep teacher identities / worktree paths as pulled")
+    p.add_argument("--pack-root", type=Path, default=None,
+                   help="agent-problem-pack root for decontamination "
+                        "(default: <repo>/agent-problem-pack)")
+    p.add_argument("--no-decontam", action="store_true",
+                   help="skip benchmark decontamination (NOT recommended)")
+    p.add_argument("--decontam-ngram", type=int, default=13)
     args = p.parse_args()
 
-    print(f"Loading {args.repo}...")
-    ds = load_dataset(args.repo)
-    eval_key = next((k for k in ("eval", "test", "validation") if k in ds), None)
-    if eval_key:
-        train_split, eval_split = ds["train"], ds[eval_key]
-        print(f"  using existing splits: train + {eval_key}")
-    else:
-        parts = ds["train"].train_test_split(test_size=args.eval_frac, seed=0)
-        train_split, eval_split = parts["train"], parts["test"]
-        print(f"  split single train split with eval_frac={args.eval_frac}")
+    data_path, _ = pull_split_clean(
+        args.repo, args.out, args.eval_frac,
+        model_name=args.model_name or args.base,
+        workspace=args.workspace_path,
+        pack_root=args.pack_root,
+        decontam=not args.no_decontam,
+        decontam_ngram=args.decontam_ngram,
+        do_sanitize=not args.no_sanitize,
+    )
 
-    args.out.mkdir(parents=True, exist_ok=True)
-    n_train = write_split(train_split, args.out / "sft.jsonl")
-    n_eval = write_split(eval_split, args.out / "sft-eval.jsonl")
-    print(f"  train: {n_train} -> {args.out / 'sft.jsonl'}")
-    print(f"  eval:  {n_eval} -> {args.out / 'sft-eval.jsonl'}")
-
-    sanity_check(dict(train_split[0]), args.base)
+    first = data_path.read_text().splitlines()[0]
+    sanity_check(json.loads(first), args.base)
 
 
 if __name__ == "__main__":
