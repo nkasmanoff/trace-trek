@@ -12,6 +12,7 @@ venv/
 # Pipeline artifacts (pipeline has its own .gitignore)
 pipeline/raw/
 pipeline/dataset/
+!pipeline/dataset/build_dataset.py # ignore build_dataset.py
 pipeline/**/*.jsonl
 !pipeline/eval/eval-tasks.jsonl
 pipeline/eval/eval-results.json

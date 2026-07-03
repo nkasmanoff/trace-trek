@@ -50,6 +50,7 @@ checkpoint-*/
 # Project-specific
 raw/
 dataset/
+!dataset/build_dataset.py # ignore build_dataset.py
 results-*.json
 results-*.jsonl
 *.log
