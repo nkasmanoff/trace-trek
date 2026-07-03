@@ -271,8 +271,9 @@ def resolve_quant(args) -> str:
     base = (args.base or "").lower()
     if "fp8" in base or "compressed" in base:
         return "fp8"
-    # bf16 LoRA for Qwen: 4-bit QLoRA is discouraged for the MoE (A3B) family.
-    if "qwen" in base:
+    # bf16 LoRA for Qwen MoE (A3B): 4-bit QLoRA is discouraged for the MoE family.
+    # Dense Qwen (e.g. Qwen3.6-27B) needs 4-bit at 64k on 140GB — bf16 OOMs.
+    if "qwen" in base and ("a3b" in base or "moe" in base):
         return "none"
     return "4bit"
 
