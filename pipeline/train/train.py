@@ -1053,8 +1053,11 @@ def pull_hf_dataset(args) -> tuple[Path, Path]:
     from pull_dataset import pull_split_clean
 
     print(f"Pulling dataset from HF: {args.hf_repo}...")
+    # pull uses chars÷4 approx_tokens; train filters with the real tokenizer at
+    # --max-seq-len — pass headroom so pull-time drops are a superset of train.
+    max_tokens = int(args.max_seq_len * 1.15)
     return pull_split_clean(args.hf_repo, args.out, args.eval_frac,
-                            model_name=args.base)
+                            model_name=args.base, max_tokens=max_tokens)
 
 
 def _write_opencode_config(out_dir: Path, base_url: str, model_id: str) -> Path:
