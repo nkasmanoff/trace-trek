@@ -30,8 +30,8 @@ DEFAULT_PACK_ROOT = PACK_ROOT
 NGRAM_SIZE = 13
 
 CORRECTION_RE = re.compile(
-    r"\b(no[,.!]|that'?s (wrong|not right|incorrect)|doesn'?t work|not what i"
-    r"|undo|revert|stop|wtf|broken|you broke|still (wrong|broken|failing))\b",
+    r"\b(no[,.!](?=\s|$)|that'?s (wrong|not right|incorrect)|doesn'?t work"
+    r"|not what i|wtf|you broke|still (wrong|broken|failing))\b",
     re.IGNORECASE,
 )
 
@@ -648,5 +648,19 @@ def main() -> int:
     return 0
 
 
+def _test_correction_re() -> None:
+    """Quick regression checks for ends_in_correction (task 10)."""
+    true_cases = ["no, that's wrong", "you broke the tests"]
+    false_cases = ["revert the last commit",
+                   "the build is broken, please fix it"]
+    for text in true_cases:
+        msgs = [{"role": "user", "content": text}]
+        assert ends_in_correction(msgs), text
+    for text in false_cases:
+        msgs = [{"role": "user", "content": text}]
+        assert not ends_in_correction(msgs), text
+
+
 if __name__ == "__main__":
+    _test_correction_re()
     raise SystemExit(main())
