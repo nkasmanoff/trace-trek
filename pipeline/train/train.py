@@ -35,6 +35,8 @@ import copy
 import json
 from pathlib import Path
 
+_LIGER_DIAG_PRINTED: set[str] = set()
+
 # Default base. Qwen3.6-35B-A3B is a 35B-total / 3B-active hybrid MoE
 # (~30 Gated DeltaNet linear-attention layers + ~10 standard attention layers +
 # 256 experts). bf16 LoRA fits one 80GB H100 (~74GB), which is why the default
@@ -714,6 +716,9 @@ def apply_liger_laguna(model) -> bool:
                     past_key_values=None, inputs_embeds=None, labels=None,
                     use_cache=None, output_router_logits=None,
                     logits_to_keep=0, skip_logits=None, **kwargs):
+        if "laguna" not in _LIGER_DIAG_PRINTED:
+            print("liger: fused CE path ACTIVE (laguna)")
+            _LIGER_DIAG_PRINTED.add("laguna")
         output_router_logits = (output_router_logits
                                 if output_router_logits is not None
                                 else self.config.output_router_logits)
@@ -721,6 +726,7 @@ def apply_liger_laguna(model) -> bool:
         return_token_accuracy = kwargs.pop("return_token_accuracy", False)
         kwargs.pop("use_token_scaling", None)
         shift_labels = kwargs.pop("shift_labels", None)
+        num_items_in_batch = kwargs.pop("num_items_in_batch", None)
 
         outputs = self.model(
             input_ids=input_ids, attention_mask=attention_mask,
@@ -743,6 +749,7 @@ def apply_liger_laguna(model) -> bool:
                 hidden_states=kept, lm_head_weight=self.lm_head.weight,
                 labels=labels, shift_labels=shift_labels,
                 hidden_size=self.config.hidden_size,
+                num_items_in_batch=num_items_in_batch,
                 return_token_accuracy=return_token_accuracy, **kwargs)
             loss, _, token_accuracy, predicted_tokens = \
                 unpack_cross_entropy_result(result)
@@ -799,6 +806,9 @@ def apply_liger_qwen3_5_moe(model) -> bool:
                     use_cache=None, output_router_logits=None,
                     cache_position=None, logits_to_keep=0, skip_logits=None,
                     **kwargs):
+        if "qwen3_5_moe" not in _LIGER_DIAG_PRINTED:
+            print("liger: fused CE path ACTIVE (qwen3_5_moe)")
+            _LIGER_DIAG_PRINTED.add("qwen3_5_moe")
         output_router_logits = (output_router_logits
                                 if output_router_logits is not None
                                 else self.config.output_router_logits)
@@ -806,6 +816,7 @@ def apply_liger_qwen3_5_moe(model) -> bool:
         return_token_accuracy = kwargs.pop("return_token_accuracy", False)
         kwargs.pop("use_token_scaling", None)
         shift_labels = kwargs.pop("shift_labels", None)
+        num_items_in_batch = kwargs.pop("num_items_in_batch", None)
 
         outputs = self.model(
             input_ids=input_ids, attention_mask=attention_mask,
@@ -831,6 +842,7 @@ def apply_liger_qwen3_5_moe(model) -> bool:
                 hidden_states=kept, lm_head_weight=self.lm_head.weight,
                 labels=labels, shift_labels=shift_labels,
                 hidden_size=self.config.hidden_size,
+                num_items_in_batch=num_items_in_batch,
                 return_token_accuracy=return_token_accuracy, **kwargs)
             loss, _, token_accuracy, predicted_tokens = \
                 unpack_cross_entropy_result(result)
@@ -882,11 +894,15 @@ def apply_liger_qwen3_5(model) -> bool:
     def lce_forward(self, input_ids=None, attention_mask=None, position_ids=None,
                     past_key_values=None, inputs_embeds=None, labels=None,
                     use_cache=None, logits_to_keep=0, **kwargs):
+        if "qwen3_5" not in _LIGER_DIAG_PRINTED:
+            print("liger: fused CE path ACTIVE (qwen3_5)")
+            _LIGER_DIAG_PRINTED.add("qwen3_5")
         # TRL passes these to control metrics; keep them out of the base model
         return_token_accuracy = kwargs.pop("return_token_accuracy", False)
         kwargs.pop("use_token_scaling", None)
         shift_labels = kwargs.pop("shift_labels", None)
         skip_logits = kwargs.pop("skip_logits", None)
+        num_items_in_batch = kwargs.pop("num_items_in_batch", None)
 
         outputs = self.model(
             input_ids=input_ids, attention_mask=attention_mask,
@@ -906,6 +922,7 @@ def apply_liger_qwen3_5(model) -> bool:
                 hidden_states=kept, lm_head_weight=self.lm_head.weight,
                 labels=labels, shift_labels=shift_labels,
                 hidden_size=self.config.hidden_size,
+                num_items_in_batch=num_items_in_batch,
                 return_token_accuracy=return_token_accuracy, **kwargs)
             loss, _, token_accuracy, predicted_tokens = \
                 unpack_cross_entropy_result(result)
