@@ -382,15 +382,25 @@ def load_opencode(raw_dir: Path,
             source = "opencode"
         convo = [normalize_message(m) for m in messages if isinstance(m, dict)]
         convo.append(normalize_message(message))
+        model_id = None
+        for obj in (resp, req):
+            if isinstance(obj, dict):
+                mid = obj.get("model")
+                if mid:
+                    model_id = str(mid)
+                    break
         key = session_key(convo)
         prev = by_session.get(key)
         if prev is None or len(convo) > len(prev["messages"]):
-            by_session[key] = {
+            row: dict[str, Any] = {
                 "messages": convo,
                 "tools": req.get("tools") or None,
                 "source": source,
                 "_group": (replay or {}).get("task_id") or key,
             }
+            if model_id:
+                row["model"] = model_id
+            by_session[key] = row
     print(f"  opencode: {n_records} records -> {len(by_session)} sessions "
           f"({n_replay_fail} failed-replay, {n_holdout} held-out records "
           f"dropped)", file=sys.stderr)

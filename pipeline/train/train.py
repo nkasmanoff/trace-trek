@@ -561,9 +561,8 @@ def load_samples(path: Path, tokenizer, fmt_cfg: dict, max_seq_len: int,
         rows.append({"input_ids": ids, "labels": labels})
     msg = (f"dataset: {len(rows)} samples from {path} "
            f"(skipped {skipped_render} unrenderable, {skipped_long} over "
-           f"{max_seq_len} tok, {skipped_nomask} no-assistant")
-    if allowed_models is not None:
-        msg += f", {skipped_model} non-teacher-model"
+           f"{max_seq_len} tok, {skipped_nomask} no-assistant, "
+           f"{skipped_model} non-teacher-model)")
     msg += ")"
     if first_error:
         msg += f"  [first render error: {first_error}]"
