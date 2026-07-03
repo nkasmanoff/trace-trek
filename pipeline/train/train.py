@@ -636,6 +636,13 @@ def try_unsloth(args, fmt: str, load_in_4bit: bool):
         use_gradient_checkpointing="unsloth",
         random_state=0,
     )
+    model.config.use_cache = False
+    try:
+        text_cfg = model.config.get_text_config()
+        if text_cfg is not None:
+            text_cfg.use_cache = False
+    except Exception:  # noqa: BLE001 — nested text config may be absent
+        pass
     return model, tokenizer, True
 
 
