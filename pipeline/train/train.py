@@ -425,11 +425,36 @@ def marker_mask(ids: list[int], resp_ids: list[int],
     return mask
 
 
+def _count_subseq(haystack: list[int], needle: list[int]) -> int:
+    if not needle:
+        return 0
+    n, pos = 0, 0
+    while True:
+        start = _find(haystack, needle, pos)
+        if start == -1:
+            break
+        n += 1
+        pos = start + len(needle)
+    return n
+
+
+def _count_mask_spans(mask: list[int]) -> int:
+    spans, in_span = 0, False
+    for m in mask:
+        if m and not in_span:
+            spans += 1
+            in_span = True
+        elif not m:
+            in_span = False
+    return spans
+
+
 def tokenize_record(rec: dict, tokenizer, fmt_cfg: dict,
                     resp_ids: list[int], end_ids: list[int],
-                    ) -> tuple[list[int], list[int]]:
-    """Return (input_ids, assistant_mask) for one record. Prefers the chat
-    template's `{% generation %}` mask; falls back to marker masking."""
+                    ) -> tuple[list[int], list[int], bool]:
+    """Return (input_ids, assistant_mask, used_marker_fallback) for one record.
+    Prefers the chat template's `{% generation %}` mask; falls back to marker
+    masking."""
     messages = prepare_messages(rec, fmt_cfg)
     tools = rec.get("tools") or None
     enc = tokenizer.apply_chat_template(
@@ -443,9 +468,11 @@ def tokenize_record(rec: dict, tokenizer, fmt_cfg: dict,
     )
     ids = list(enc["input_ids"])
     mask = enc.get("assistant_masks")
+    used_marker = False
     if not mask or sum(mask) == 0:
         mask = marker_mask(ids, resp_ids, end_ids)
-    return ids, list(mask)
+        used_marker = True
+    return ids, list(mask), used_marker
 
 
 def preflight_template(tokenizer, fmt_cfg: dict,
@@ -496,7 +523,7 @@ def preflight_template(tokenizer, fmt_cfg: dict,
             f"training would not teach the behavior we collected.\n"
             f"--- rendered sample (truncated) ---\n{text[:2000]}"
         )
-    _, mask = tokenize_record(rec, tokenizer, fmt_cfg, resp_ids, end_ids)
+    _, mask = tokenize_record(rec, tokenizer, fmt_cfg, resp_ids, end_ids)[:2]
     if sum(mask) == 0:
         raise SystemExit(
             "FATAL: could not derive an assistant-token mask (template has no "
@@ -540,6 +567,7 @@ def load_samples(path: Path, tokenizer, fmt_cfg: dict, max_seq_len: int,
     rows = []
     skipped_render = skipped_long = skipped_nomask = skipped_model = 0
     first_error: str | None = None
+    sample_idx = 0
     for line in path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
@@ -548,13 +576,22 @@ def load_samples(path: Path, tokenizer, fmt_cfg: dict, max_seq_len: int,
             skipped_model += 1
             continue
         try:
-            ids, mask = tokenize_record(rec, tokenizer, fmt_cfg,
-                                        resp_ids, end_ids)
+            ids, mask, used_marker = tokenize_record(rec, tokenizer, fmt_cfg,
+                                                     resp_ids, end_ids)
         except Exception as exc:  # noqa: BLE001 — bad sample, skip
             skipped_render += 1
             if first_error is None:
                 first_error = repr(exc)
+            sample_idx += 1
             continue
+        if used_marker and resp_ids:
+            n_markers = _count_subseq(ids, resp_ids)
+            n_spans = _count_mask_spans(mask)
+            if n_markers != n_spans:
+                print(f"WARNING: sample {sample_idx}: marker mask found "
+                      f"{n_spans} assistant span(s) but {n_markers} "
+                      f"response-marker occurrence(s)")
+        sample_idx += 1
         if len(ids) >= max_seq_len:
             skipped_long += 1
             continue
