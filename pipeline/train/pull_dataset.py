@@ -169,6 +169,14 @@ def pull_split_clean(repo: str, out: Path, eval_frac: float, model_name: str,
         eval_rows = [r for i, r in enumerate(rows) if i in eval_idx]
         print(f"  split single train file with eval_frac={eval_frac} (seed 0)")
 
+    train_keys = {bd.session_key(r["messages"]) for r in train_rows}
+    eval_keys = {bd.session_key(r["messages"]) for r in eval_rows}
+    overlap = train_keys & eval_keys
+    if overlap:
+        raise SystemExit(
+            f"FATAL: {len(overlap)} session_key(s) overlap between train and "
+            f"eval after cleaning — eval leakage. Re-run with updated pipeline.")
+
     out.mkdir(parents=True, exist_ok=True)
     data_path, eval_path = out / "sft.jsonl", out / "sft-eval.jsonl"
     print(f"  train: {write_split(train_rows, data_path)} -> {data_path}")
