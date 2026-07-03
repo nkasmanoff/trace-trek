@@ -163,10 +163,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--chat-format", choices=["auto", "qwen", "laguna", "cohere"],
                    default="auto",
                    help="chat template family (auto-detected from --base)")
-    # Laguna sequences are long (opencode-sft: mean ~30k, p95 ~79k tokens).
-    # 65536 keeps roughly the shorter ~90% of samples; lower it (e.g. 32768)
-    # if a single 80GB H100 OOMs at this context length.
-    p.add_argument("--max-seq-len", type=int, default=65536)
+    # 65535 avoids Unsloth's patch_sdpa_bool_causal_mask edge at seq >= 2^16
+    # (65536), which materializes a full SDPA mask and OOMs at long context.
+    p.add_argument("--max-seq-len", type=int, default=65535,
+                   help="max tokens per sample (default 65535; keep below 2^16 "
+                        "because Unsloth's SDPA patch switches to a mask-"
+                        "materializing path at seq >= 65536)")
     p.add_argument("--epochs", type=float, default=2.0)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--lora-r", type=int, default=16)
@@ -547,7 +549,7 @@ def load_samples(path: Path, tokenizer, fmt_cfg: dict, max_seq_len: int,
             if first_error is None:
                 first_error = repr(exc)
             continue
-        if len(ids) > max_seq_len:
+        if len(ids) >= max_seq_len:
             skipped_long += 1
             continue
         if sum(mask) == 0:
