@@ -253,14 +253,14 @@ def _pack_text_files(pack_root: Path) -> list[Path]:
     return files
 
 
-def build_pack_ngrams(pack_root: Path) -> set[str]:
+def build_pack_ngrams(pack_root: Path, ngram: int = NGRAM_SIZE) -> set[str]:
     ngrams: set[str] = set()
     for path in _pack_text_files(pack_root):
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        ngrams.update(_iter_ngrams(text))
+        ngrams.update(_iter_ngrams(text, ngram))
     return ngrams
 
 
@@ -279,15 +279,16 @@ def record_text(rec: dict) -> str:
     return "\n".join(parts)
 
 
-def decontaminate(samples: list[dict], pack_root: Path | None = None) -> list[dict]:
-    """Drop samples whose text contains a 13-gram from agent-problem-pack."""
+def decontaminate(samples: list[dict], pack_root: Path | None = None,
+                  ngram: int = NGRAM_SIZE) -> list[dict]:
+    """Drop samples whose text contains an n-gram from agent-problem-pack."""
     root = pack_root or PACK_ROOT
     if not root.is_dir():
         print("decontam: SKIPPED (pack not found)", file=sys.stderr)
         return samples
 
     pack_files = _pack_text_files(root)
-    pack_ngrams = build_pack_ngrams(root)
+    pack_ngrams = build_pack_ngrams(root, ngram)
     if not pack_ngrams:
         print(f"decontam: SKIPPED (no n-grams from {root})", file=sys.stderr)
         return samples
@@ -295,13 +296,13 @@ def decontaminate(samples: list[dict], pack_root: Path | None = None) -> list[di
     kept, ngram_drops = [], 0
     for s in samples:
         text = record_text(s)
-        if set(_iter_ngrams(text)) & pack_ngrams:
+        if set(_iter_ngrams(text, ngram)) & pack_ngrams:
             ngram_drops += 1
             continue
         kept.append(s)
 
     print(f"decontam: kept {len(kept)}, dropped {{'ngram': {ngram_drops}}} "
-          f"(pack={len(pack_files)} files, {len(pack_ngrams)} {NGRAM_SIZE}-grams)",
+          f"(pack={len(pack_files)} files, {len(pack_ngrams)} {ngram}-grams)",
           file=sys.stderr)
     return kept
 
@@ -481,9 +482,11 @@ def balance(samples: list[dict], max_ratio: float, seed: int = 0) -> list[dict]:
     return out
 
 
-def _drop_marker_contaminated(samples: list[dict]) -> list[dict]:
+def _drop_marker_contaminated(samples: list[dict],
+                             pack_root: Path | None = None) -> list[dict]:
     """Drop rows whose serialized trace hits pack-specific contamination markers."""
-    script = PACK_ROOT / "scripts" / "check_contamination.py"
+    root = pack_root or PACK_ROOT
+    script = root / "scripts" / "check_contamination.py"
     if not script.is_file():
         return samples
     import importlib.util
@@ -522,8 +525,9 @@ def clean_sft_records(
         samples = sanitize(samples, model_name, workspace)
     samples = dedupe_prefix(samples)
     if decontam:
-        samples = decontaminate(samples, pack_root or PACK_ROOT)
-    return _drop_marker_contaminated(samples)
+        samples = decontaminate(samples, pack_root or PACK_ROOT,
+                                ngram=decontam_ngram)
+    return _drop_marker_contaminated(samples, pack_root or PACK_ROOT)
 
 
 def process_sft_input(args: argparse.Namespace) -> int:
