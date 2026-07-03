@@ -136,16 +136,26 @@ def pull_split_clean(repo: str, out: Path, eval_frac: float, model_name: str,
                      ) -> tuple[Path, Path]:
     """Pull `repo`, clean it, and write out/sft.jsonl + out/sft-eval.jsonl.
     Also used by train.py --hf-repo so both download paths stay clean."""
+    bd = _build_dataset_module()
     print(f"Loading {repo}...")
     train_rows, eval_rows = fetch_repo_rows(repo)
     if eval_rows is not None:
         print("  using existing train + eval splits")
-        train_rows = clean_rows(train_rows, model_name, workspace,
-                                pack_root, decontam, decontam_ngram, do_sanitize,
-                                max_tokens)
-        eval_rows = clean_rows(eval_rows, model_name, workspace,
-                               pack_root, decontam, decontam_ngram, do_sanitize,
-                               max_tokens)
+        tagged = ([{**r, "_split": "train"} for r in train_rows]
+                  + [{**r, "_split": "eval"} for r in eval_rows])
+        cleaned = clean_rows(tagged, model_name, workspace,
+                             pack_root, decontam, decontam_ngram, do_sanitize,
+                             max_tokens)
+        train_rows, eval_rows = [], []
+        for r in cleaned:
+            row = {k: v for k, v in r.items() if k != "_split"}
+            if r.get("_split") == "eval":
+                eval_rows.append(row)
+            else:
+                train_rows.append(row)
+        eval_keys = {bd.session_key(r["messages"]) for r in eval_rows}
+        train_rows = [r for r in train_rows
+                      if bd.session_key(r["messages"]) not in eval_keys]
     else:
         # Clean BEFORE splitting so decontam-dropped rows can't skew the split.
         rows = clean_rows(train_rows, model_name, workspace,

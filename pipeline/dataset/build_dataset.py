@@ -206,8 +206,22 @@ def dedupe_prefix(samples: list[dict]) -> list[dict]:
     for s in samples:
         key = session_key(s["messages"])
         prev = by_key.get(key)
-        if prev is None or len(s["messages"]) > len(prev["messages"]):
+        if prev is None:
             by_key[key] = s
+            continue
+        if len(s["messages"]) > len(prev["messages"]):
+            survivor = s
+        elif len(s["messages"]) < len(prev["messages"]):
+            survivor = prev
+        elif s.get("_split") == "eval":
+            survivor = s
+        else:
+            survivor = prev
+        if survivor.get("_split") != "eval" and (
+                s.get("_split") == "eval" or prev.get("_split") == "eval"):
+            survivor = dict(survivor)
+            survivor["_split"] = "eval"
+        by_key[key] = survivor
     kept = list(by_key.values())
     print(f"  dedupe: {len(samples)} -> {len(kept)} sessions", file=sys.stderr)
     return kept
