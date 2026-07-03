@@ -181,3 +181,18 @@ rsync -avz <pod>:/workspace/outputs/adapter/ ./adapters/v2/
   destabilizes MoE training.
 - If you only want the adapter (to merge locally later), pass `--no-merge`
   and rsync `outputs/adapter/` (~100MB) instead of the 60GB merge.
+
+## GPU smoke test (dense Qwen 27B at 64k)
+
+On an H200 pod with a pulled dataset:
+
+```bash
+cd pipeline/train
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+python train.py --quant 4bit --no-unsloth --no-eval --mem-debug \
+  --max-samples 2 --smoke-longest --data outputs/sft.jsonl --out outputs
+```
+
+Expect `== 4bit LoRA ==`, `liger: fused CE path ACTIVE (qwen3_5)` on step 0,
+the two longest samples selected, and either a training step or
+`outputs/oom_snapshot.pickle` on OOM.

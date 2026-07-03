@@ -247,6 +247,9 @@ def parse_args() -> argparse.Namespace:
                         "<repo>-merged (large; non-fp8 paths only)")
     p.add_argument("--hub-private", action="store_true",
                    help="create the pushed HF repo(s) as private")
+    p.add_argument("--mem-debug", action="store_true",
+                   help="record CUDA memory history and dump a snapshot on OOM "
+                        "(pytorch.org/memory_viz; has overhead)")
     return p.parse_args()
 
 
@@ -621,6 +624,8 @@ class MaskedCollator:
     tokens only — the model's reasoning, tool calls, and final answer — never on
     system/user/tool tokens. Padding extends labels with -100."""
 
+    _printed_first_batch = False
+
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
         self.pad_id = (tokenizer.pad_token_id
@@ -646,11 +651,18 @@ class MaskedCollator:
                 input_ids.append([self.pad_id] * pad + s)
                 attn.append([0] * pad + a)
                 labels.append([-100] * pad + lb)
-        return {
+        batch = {
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
             "attention_mask": torch.tensor(attn, dtype=torch.long),
             "labels": torch.tensor(labels, dtype=torch.long),
         }
+        if not MaskedCollator._printed_first_batch:
+            lengths = [len(s) for s in seqs]
+            print(f"collator: first batch input_ids.shape={batch['input_ids'].shape} "
+                  f"attention_mask.dtype={batch['attention_mask'].dtype} "
+                  f"lengths={lengths}")
+            MaskedCollator._printed_first_batch = True
+        return batch
 
 
 def try_unsloth(args, fmt: str, load_in_4bit: bool):
@@ -1471,7 +1483,16 @@ def main() -> None:
     )
     print("loss masked to assistant turns (assistant-token mask)")
 
-    trainer.train()
+    if args.mem_debug:
+        torch.cuda.memory._record_memory_history(max_entries=200_000)
+    try:
+        trainer.train()
+    except torch.OutOfMemoryError:
+        if args.mem_debug:
+            snap = args.out / "oom_snapshot.pickle"
+            torch.cuda.memory._dump_snapshot(str(snap))
+            print(f"OOM: memory snapshot -> {snap} (open at pytorch.org/memory_viz)")
+        raise
 
     adapter_dir = args.out / "adapter"
     model.save_pretrained(str(adapter_dir))
