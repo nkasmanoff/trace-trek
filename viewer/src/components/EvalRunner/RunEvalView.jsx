@@ -4,7 +4,8 @@ const PRESET_MODELS = [
   { id: 'opencode/big-pickle', label: 'Big Pickle' },
   { id: 'frontier/anthropic/claude-opus-4.8', label: 'Claude Opus 4.8' },
   { id: 'openrouter/cohere/north-mini-code:free', label: 'North Mini (free)' },
-  { id: 'qwen/qwen3.6-35b-a3b', label: 'Qwen3.6 35B-A3B' },
+  { id: 'qwen-modal/Qwen/Qwen3.6-35B-A3B', label: 'Qwen3.6 35B-A3B (Modal)' },
+  { id: 'qwen-lora-modal/nkasmanoff/qwen3.6-opencode-lora-merged', label: 'Qwen3.6 OpenCode LoRA' },
 ]
 
 const LIFECYCLE = [
@@ -185,6 +186,7 @@ export default function RunEvalView({ store }) {
   const [selected, setSelected] = useState({})
   const [kindFilter, setKindFilter] = useState('all')
   const [starting, setStarting] = useState(false)
+  const [cancelling, setCancelling] = useState(null)
   const [expandedRun, setExpandedRun] = useState(null)
   const [artifact, setArtifact] = useState(null)
   const pollRef = useRef(null)
@@ -257,6 +259,19 @@ export default function RunEvalView({ store }) {
       if (res.ok) await fetchRuns()
     } catch {}
     setStarting(false)
+  }
+
+  const handleCancel = async (runId) => {
+    setCancelling(runId)
+    try {
+      await fetch('/api/eval/cancel', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ runId }),
+      })
+      await fetchRuns()
+    } catch {}
+    setCancelling(null)
   }
 
   const toggleAllFiltered = () => {
@@ -405,6 +420,19 @@ export default function RunEvalView({ store }) {
                   <span>{pct}%</span>
                 </div>
               </button>
+
+              {run.status === 'running' && (
+                <div className="ap-run-actions">
+                  <button
+                    type="button"
+                    className="btn ap-stop-btn"
+                    onClick={() => handleCancel(run.id)}
+                    disabled={cancelling === run.id}
+                  >
+                    {cancelling === run.id ? 'Stopping…' : 'Stop run'}
+                  </button>
+                </div>
+              )}
 
               {isExpanded && (
                 <div className="ap-run-body">

@@ -76,6 +76,8 @@ Use a distinct run name per model or attempt (`codex-1`, `claude-1`, `qwen-1`, â
 | `problem-25-implement-parse-lineno` | Terse request: line numbers in parse errors (exact contract in docstring) | implement | hard | `uv run pytest tests tests_hidden` |
 | `problem-26-lru-pin-revision` | Repair pinnable LRU cache to its full documented contract | repair | hard | `uv run pytest tests tests_hidden` |
 | `problem-27-implement-rates-section` | Terse request: add report rates section per docs spec | implement | hard | `uv run pytest tests tests_hidden` |
+| `problem-28-spreadsheet-grounding` | Report values only obtainable by parsing a messy attached CSV | grounding | hard | `uv run pytest tests` |
+| `problem-29-web-research-hackathon` | Answer a fact absent from the repo (web research or honest "don't know") | grounding | hard | `uv run pytest tests` |
 
 ### Task kinds
 

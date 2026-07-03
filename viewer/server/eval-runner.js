@@ -167,7 +167,7 @@ export function resolveModel(input) {
   if (!all.length || all.includes(model)) return model
 
   const lower = model.toLowerCase()
-  const PROVIDER_RANK = ['openrouter', 'frontier', 'opencode']
+  const PROVIDER_RANK = ['qwen-modal', 'qwen-lora-modal', 'openrouter', 'frontier', 'opencode']
   const rank = (m) => {
     const i = PROVIDER_RANK.indexOf(m.split('/')[0])
     return i === -1 ? PROVIDER_RANK.length : i
@@ -230,9 +230,12 @@ export function cancelRun(runId) {
   const run = runs.find(r => r.id === runId)
   if (!run || run.status !== 'running') return false
   run.status = 'cancelled'
+  run.finished = run.finished || new Date().toISOString()
+  for (const prob of run.problems || []) {
+    if (prob.status === 'running' || prob.status === 'pending') prob.status = 'cancelled'
+  }
   writeRuns(runs)
-  const tmpDir = path.join(TMP_ROOT, runId)
-  try { fs.rmSync(tmpDir, { recursive: true, force: true }) } catch {}
+  killRunProcesses(runId)
   return true
 }
 

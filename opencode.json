@@ -30,6 +30,42 @@
         }
       }
     },
+    "modal-qwen3.6": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Modal Qwen3.6 35B-A3B",
+      "options": {
+        "baseURL": "https://nkasmanoff--ep-qwen3-6-35b-a3b-server.us-west.modal.direct/v1",
+        "headers": {
+          "Modal-Key": "{env:MODAL_PROXY_AUTH_TOKEN_ID}",
+          "Modal-Secret": "{env:MODAL_PROXY_AUTH_TOKEN_SECRET}"
+        },
+        "timeout": 600000,
+        "chunkTimeout": 180000
+      },
+      "models": {
+        "nkasmanoff/qwen3.6-35b-a3b": {
+          "name": "Qwen3.6 35B-A3B"
+        }
+      }
+    },
+    "modal-qwen3.6-opencode": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Modal Qwen3.6 OpenCode (LoRA)",
+      "options": {
+        "baseURL": "https://nkasmanoff--ep-qwen3-6-opencode-lora-merged-server.us-west.modal.direct/v1",
+        "headers": {
+          "Modal-Key": "{env:MODAL_PROXY_AUTH_TOKEN_ID}",
+          "Modal-Secret": "{env:MODAL_PROXY_AUTH_TOKEN_SECRET}"
+        },
+        "timeout": 600000,
+        "chunkTimeout": 180000
+      },
+      "models": {
+        "nkasmanoff/qwen3.6-opencode-lora-merged": {
+          "name": "Qwen3.6 OpenCode LoRA (merged)"
+        }
+      }
+    },
     "openrouter": {
       "npm": "@ai-sdk/openai-compatible",
       "name": "OpenRouter",

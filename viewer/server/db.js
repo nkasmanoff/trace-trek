@@ -57,9 +57,55 @@ const DEAD_LIKE = [
   '%syntaxerror%',
 ].map(p => `lower(json_extract(data,'$.state.output')) LIKE '${p}'`).join(' OR ')
 
-/* Every session with its stored aggregates. parent_id IS NULL filtering is
-   left to the caller; we return everything and tag whether it's a subagent. */
-export function listSessions(dbPath) {
+// Columns the client is allowed to sort by, mapped to their SQL expression.
+// `tokensTotal` sorts by the stored input+output sum; `cacheRate` by the ratio.
+const SORT_COLUMNS = {
+  title: 'title',
+  updated: 'time_updated',
+  created: 'time_created',
+  model: 'model',
+  directory: 'directory',
+  cost: 'cost',
+  tokensTotal: '(tokens_input + tokens_output)',
+  cacheRate: `(CASE WHEN tokens_input > 0 THEN CAST(tokens_cache_read AS REAL)/tokens_input ELSE 0 END)`,
+}
+
+/* A page of sessions with their stored aggregates. Filtering (search text +
+   subagent visibility), sorting and paging all happen in SQL so the initial
+   load only touches `limit` rows. Returns { sessions, total } where `total` is
+   the count of rows matching the filter (for "load more" bookkeeping).
+
+   opts: { limit, offset, search, sort, dir, includeSubagents } */
+export function listSessions(dbPath, opts = {}) {
+  const {
+    limit = 15,
+    offset = 0,
+    search = '',
+    sort = 'updated',
+    dir = 'desc',
+    includeSubagents = false,
+  } = opts
+
+  const where = []
+  if (!includeSubagents) where.push('parent_id IS NULL')
+  const q = String(search || '').trim().toLowerCase()
+  if (q) {
+    const like = sqlStr('%' + q.replace(/[%_]/g, s => '\\' + s) + '%')
+    where.push(
+      `(lower(title) LIKE ${like} ESCAPE '\\'` +
+      ` OR lower(directory) LIKE ${like} ESCAPE '\\'` +
+      ` OR lower(model) LIKE ${like} ESCAPE '\\')`
+    )
+  }
+  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : ''
+
+  const total = query(dbPath, `SELECT count(*) AS c FROM session ${whereSql}`)[0]?.c || 0
+
+  const sortExpr = SORT_COLUMNS[sort] || SORT_COLUMNS.updated
+  const sortDir = String(dir).toLowerCase() === 'asc' ? 'ASC' : 'DESC'
+  const lim = Math.max(1, Math.min(500, parseInt(limit, 10) || 15))
+  const off = Math.max(0, parseInt(offset, 10) || 0)
+
   const rows = query(dbPath, `
     SELECT
       id, title, project_id, parent_id, directory, agent, model,
@@ -67,14 +113,20 @@ export function listSessions(dbPath) {
       tokens_cache_read, tokens_cache_write,
       time_created, time_updated
     FROM session
-    ORDER BY time_updated DESC
+    ${whereSql}
+    ORDER BY ${sortExpr} ${sortDir}
+    LIMIT ${lim} OFFSET ${off}
   `)
+
+  if (!rows.length) return { sessions: [], total }
+
+  const idIn = rows.map(r => sqlStr(r.id)).join(',')
 
   const toolCounts = {}
   for (const r of query(dbPath, `
     SELECT session_id AS s, count(*) AS c
     FROM part
-    WHERE json_extract(data,'$.type')='tool'
+    WHERE session_id IN (${idIn}) AND json_extract(data,'$.type')='tool'
     GROUP BY session_id
   `)) toolCounts[r.s] = r.c
 
@@ -82,7 +134,7 @@ export function listSessions(dbPath) {
   for (const r of query(dbPath, `
     SELECT session_id AS s, count(*) AS c
     FROM part
-    WHERE json_extract(data,'$.type')='tool' AND (${DEAD_LIKE})
+    WHERE session_id IN (${idIn}) AND json_extract(data,'$.type')='tool' AND (${DEAD_LIKE})
     GROUP BY session_id
   `)) deadCounts[r.s] = r.c
 
@@ -90,11 +142,11 @@ export function listSessions(dbPath) {
   for (const r of query(dbPath, `
     SELECT session_id AS s, count(*) AS c
     FROM message
-    WHERE json_extract(data,'$.role')='assistant'
+    WHERE session_id IN (${idIn}) AND json_extract(data,'$.role')='assistant'
     GROUP BY session_id
   `)) msgCounts[r.s] = r.c
 
-  return rows.map(r => {
+  const sessions = rows.map(r => {
     let model = ''
     if (r.model) {
       try { model = JSON.parse(r.model).id || '' } catch { model = String(r.model) }
@@ -123,6 +175,8 @@ export function listSessions(dbPath) {
       deadEnds: deadCounts[r.id] || 0,
     }
   })
+
+  return { sessions, total }
 }
 
 /* Cross-session analytics computed entirely in SQL: totals, by-model,

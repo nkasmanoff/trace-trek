@@ -809,6 +809,12 @@ pre.payload {
   margin-top: 14px;
   font-family: var(--mono);
 }
+.sess-more {
+  display: flex;
+  justify-content: center;
+  margin-top: 14px;
+}
+.sess-more .btn:disabled { opacity: .5; cursor: default; }
 .sess-toolbar .btn:disabled { opacity: .5; cursor: default; }
 .sel-col { width: 34px; text-align: center; padding-left: 10px !important; }
 .sel-col input { cursor: pointer; }
@@ -1024,6 +1030,19 @@ pre.payload {
   text-align: left;
 }
 .ap-run-head:hover { background: #FCFBF7; }
+.ap-run-actions {
+  display: flex;
+  justify-content: flex-end;
+  padding: 0 14px 12px;
+}
+.ap-stop-btn {
+  color: #B4402E;
+  border-color: #E5B4AB;
+}
+.ap-stop-btn:hover:not(:disabled) {
+  background: #FBEDEA;
+  border-color: #B4402E;
+}
 .ap-run-title { font-weight: 600; font-size: 14px; }
 .ap-run-sub { color: var(--muted); font-family: var(--mono); font-size: 11px; margin-top: 3px; }
 .ap-run-meter {

@@ -71,10 +71,13 @@ export default function App() {
         {view === 'sessions' && (
           <SessionList
             sessionList={store.sessionList}
+            sessionTotal={store.sessionTotal}
             loadingList={store.loadingList}
+            loadingMore={store.loadingMore}
             loadingSession={store.loadingSession}
+            pageSize={store.PAGE_SIZE}
             onLoadSession={store.loadSession}
-            onRefresh={() => { store.fetchSessionList(); store.fetchAnalytics() }}
+            onFetchPage={store.fetchSessionList}
             onLoadFiles={store.loadFiles}
             onDropFiles={store.loadFiles}
             onExport={store.exportSessions}

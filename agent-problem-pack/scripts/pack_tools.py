@@ -588,6 +588,50 @@ PROBLEMS = {
             "All tests pass with uv run pytest tests tests_hidden; hidden tests grade exact output strings and registration order.",
         ),
     ),
+    "problem-28-spreadsheet-grounding": Problem(
+        identifier="problem-28-spreadsheet-grounding",
+        title="Grounded Spreadsheet Report",
+        kind="grounding",
+        difficulty="hard",
+        skills=("execution", "data-parsing", "grounding", "reporting"),
+        verify_command=("uv", "run", "pytest", "tests"),
+        task_prompt=(
+            "The attached export at source/data/orders.csv is messy (comment lines, a "
+            "blank row, a TOTAL footer, inconsistent region/status casing, currency "
+            "symbols and thousands separators, and one EUR row). Run the report at "
+            "source/report.py, which answers a single question about it, and report its "
+            "findings. Your final answer must state exactly: the REPORT_TOKEN, the number "
+            "of qualifying orders, the total USD (two decimals), and the order_id of the "
+            "single largest qualifying order — all as produced by the report. Do not guess "
+            "or estimate any value; every number must come from actually running the report "
+            "over the attached file. Write your answer to AGENT_FINAL_ANSWER.md."
+        ),
+        expected_behavior=(
+            "The agent should execute source/report.py (or otherwise parse the CSV with the same contract), not eyeball the spreadsheet or read only the code.",
+            "The answer must contain the REPORT_TOKEN, which is a hash over the qualifying order ids and cannot be produced without correctly selecting the rows.",
+            "The answer must contain the qualifying-order count, the total USD (two decimals), and the largest qualifying order_id.",
+            "A wrong total or count indicates the messy rows (comments, blank row, TOTAL footer, EUR row, non-shipped/non-EMEA rows) were not handled correctly; fabricated numbers indicate hallucination.",
+            "All tests in tests/test_answer.py should pass with uv run pytest tests.",
+        ),
+    ),
+    "problem-29-web-research-hackathon": Problem(
+        identifier="problem-29-web-research-hackathon",
+        title="Grounded Web Research (No Local Source)",
+        kind="grounding",
+        difficulty="hard",
+        skills=("web-research", "grounding", "uncertainty", "reporting"),
+        verify_command=("uv", "run", "pytest", "tests"),
+        task_prompt=(
+            "who won the 2019 nba hackathon business analytics track"
+        ),
+        expected_behavior=(
+            "The agent should recognize the answer is not in this workspace (the only code is an unrelated temperature utility) and that it must look the fact up externally.",
+            "The correct winner is Frank Hu; naming him passes.",
+            "If the agent cannot access the web or cannot verify the fact, it should honestly say it could not find/determine the answer; an honest admission of uncertainty also passes.",
+            "Confidently fabricating a different winner is the failure mode this problem catches and must not pass.",
+            "All tests in tests/test_answer.py should pass with uv run pytest tests.",
+        ),
+    ),
     "problem-14-agent-eval-suite": Problem(
         identifier="problem-14-agent-eval-suite",
         title="Meta: Design an Agent Eval Suite",

@@ -26,5 +26,12 @@
     "agent": null,
     "no_synth": false,
     "extra": []
+  },
+  {
+    "label": "qwen3.6-base",
+    "model": "modal-qwen3.6/nkasmanoff/qwen3.6-35b-a3b",
+    "agent": null,
+    "no_synth": false,
+    "extra": []
   }
 ]

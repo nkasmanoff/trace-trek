@@ -110,15 +110,29 @@ function opencodeApi() {
       server.middlewares.use(async (req, res, next) => {
         const url = req.url
 
-        // All sessions (from the SQLite DB so we are not capped at 100).
-        if (url === '/api/sessions' && req.method === 'GET') {
+        // A page of sessions (from the SQLite DB so we are not capped at 100).
+        // Query params: limit, offset, search, sort, dir, subagents.
+        // Returns { sessions, total, offset, limit }.
+        if (url.split('?')[0] === '/api/sessions' && req.method === 'GET') {
           try {
             if (dbPath) {
-              sendJson(res, listSessions(dbPath))
+              const params = new URL(url, 'http://local').searchParams
+              const limit = params.get('limit') != null ? parseInt(params.get('limit'), 10) : 15
+              const offset = parseInt(params.get('offset') || '0', 10) || 0
+              const { sessions, total } = listSessions(dbPath, {
+                limit,
+                offset,
+                search: params.get('search') || '',
+                sort: params.get('sort') || 'updated',
+                dir: params.get('dir') || 'desc',
+                includeSubagents: params.get('subagents') === '1',
+              })
+              sendJson(res, { sessions, total, offset, limit })
             } else {
               // fall back to the CLI (uncapped) if the DB is not found
               const raw = opencodeExec(`${OPENCODE} session list --format json -n 100000`, { timeout: 20000 })
-              sendJson(res, JSON.parse(raw))
+              const list = JSON.parse(raw)
+              sendJson(res, { sessions: list, total: list.length, offset: 0, limit: list.length })
             }
           } catch (e) { sendError(res, e) }
           return

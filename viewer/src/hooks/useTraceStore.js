@@ -13,7 +13,9 @@ export default function useTraceStore() {
 
   // opencode browse layer
   const [sessionList, setSessionList] = useState([])
+  const [sessionTotal, setSessionTotal] = useState(0)
   const [loadingList, setLoadingList] = useState(false)
+  const [loadingMore, setLoadingMore] = useState(false)
   const [analytics, setAnalytics] = useState(null)
   const [loadingSession, setLoadingSession] = useState(false)
   // 'files' (drop/paste/folder) or 'opencode' (a session loaded from the DB)
@@ -156,19 +158,36 @@ export default function useTraceStore() {
   const reset = backToSessions
 
   // ---- opencode browse layer ----
-  const fetchSessionList = useCallback(async () => {
-    setLoadingList(true)
+  const PAGE_SIZE = 15
+
+  // Fetch a page of sessions. opts: { offset, search, sort, dir, subagents, append }.
+  // When append is true the page is concatenated onto the current list
+  // ("load more"); otherwise it replaces it (new search/sort/first load).
+  const fetchSessionList = useCallback(async (opts = {}) => {
+    const { offset = 0, search = '', sort = 'updated', dir = 'desc', subagents = false, append = false } = opts
+    if (append) setLoadingMore(true); else setLoadingList(true)
     try {
-      const res = await fetch('/api/sessions')
+      const qs = new URLSearchParams({
+        limit: String(PAGE_SIZE),
+        offset: String(offset),
+        sort,
+        dir,
+        subagents: subagents ? '1' : '0',
+      })
+      if (search) qs.set('search', search)
+      const res = await fetch(`/api/sessions?${qs.toString()}`)
       if (!res.ok) throw new Error('Failed to fetch session list')
-      const list = await res.json()
-      setSessionList(list)
-      return list
+      const data = await res.json()
+      const page = Array.isArray(data) ? data : (data.sessions || [])
+      const total = Array.isArray(data) ? page.length : (data.total || 0)
+      setSessionTotal(total)
+      setSessionList(prev => append ? [...prev, ...page] : page)
+      return page
     } catch (e) {
       setError('Could not load session list: ' + e.message)
       return []
     } finally {
-      setLoadingList(false)
+      if (append) setLoadingMore(false); else setLoadingList(false)
     }
   }, [])
 
@@ -310,12 +329,12 @@ export default function useTraceStore() {
 
   return {
     rawRecords, sessions, activeIdx, view, preloadedEval, error,
-    sessionList, loadingList, analytics, loadingSession, loadedSource, capabilities,
+    sessionList, sessionTotal, loadingList, loadingMore, analytics, loadingSession, loadedSource, capabilities,
     setActiveIdx, setView, setError,
     ingestRecords, ingestTexts, loadText, loadFiles,
     loadPreloadedEval, switchView, openRecordInAnatomy,
     getCurrentTrace, getCurrentMetrics, hasEvalRows,
     backToSessions, reset, rebuildSessions,
-    fetchSessionList, fetchAnalytics, loadSession, exportSessions, uploadSessions, fetchCapabilities,
+    fetchSessionList, PAGE_SIZE, fetchAnalytics, loadSession, exportSessions, uploadSessions, fetchCapabilities,
   }
 }

@@ -134,7 +134,7 @@ def test_capture_run_accepts_pack_root_relative_run_dir(tmp_path):
 def test_all_problems_registered_with_metadata():
     tools = load_pack_tools()
 
-    assert len(tools.PROBLEMS) == 27
+    assert len(tools.PROBLEMS) == 29
     for problem in tools.PROBLEMS.values():
         assert problem.kind in {"repair", "comprehension", "implement", "grounding"}
         assert problem.difficulty in {"easy", "medium", "hard"}
@@ -173,9 +173,9 @@ def test_catalog_lists_all_problems():
     tools = load_pack_tools()
 
     items = tools.catalog_problems()
-    assert len(items) == 27
+    assert len(items) == 29
     assert items[0]["number"] == 1
-    assert items[-1]["number"] == 27
+    assert items[-1]["number"] == 29
     assert all(
         item["kind"] in {"repair", "comprehension", "implement", "grounding"}
         for item in items

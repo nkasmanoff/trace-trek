@@ -61,6 +61,8 @@ MARKERS: dict[str, tuple[str, ...]] = {
     "problem-25-implement-parse-lineno": ("logkit", "bad key in"),
     "problem-26-lru-pin-revision": ("lrupin", "all entries pinned"),
     "problem-27-implement-rates-section": ("section_rates", "REPORT_FORMAT.md"),
+    "problem-28-spreadsheet-grounding": ("REPORT_TOKEN", "report_token("),
+    "problem-29-web-research-hackathon": ("nba hackathon", "frank hu"),
 }
 
 

@@ -1,4 +1,4 @@
-import { useState, useMemo } from 'react'
+import { useState, useMemo, useEffect, useRef } from 'react'
 import { fmt, fmtTokens, fmtCostFine, pct, fmtTime, shortTitle, shortModel, shortDir } from '../utils/format'
 import ExportControls from './ExportControls'
 
@@ -14,9 +14,13 @@ const COLUMNS = [
   { key: 'cost', label: 'Cost', num: true },
 ]
 
+// calls/toolCalls are per-page aggregates that aren't stored on the session
+// row, so they can't be sorted server-side; the rest map to SQL columns.
+const SERVER_SORTABLE = new Set(['title', 'updated', 'model', 'directory', 'tokensTotal', 'cacheRate', 'cost'])
+
 export default function SessionList({
-  sessionList, loadingList, loadingSession,
-  onLoadSession, onRefresh, onLoadFiles, onDropFiles,
+  sessionList, sessionTotal, loadingList, loadingMore, loadingSession, pageSize = 15,
+  onLoadSession, onFetchPage, onLoadFiles, onDropFiles,
   onExport, onUpload, canFilter, canUpload,
 }) {
   const [sortKey, setSortKey] = useState('updated')
@@ -26,31 +30,50 @@ export default function SessionList({
   const [dragging, setDragging] = useState(false)
   const [selected, setSelected] = useState(() => new Set())
 
+  // Debounce the search box, then (re)fetch the first page server-side whenever
+  // the query, sort, or subagent toggle changes.
+  const didMount = useRef(false)
+  const [debouncedSearch, setDebouncedSearch] = useState('')
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedSearch(search), 250)
+    return () => clearTimeout(t)
+  }, [search])
+
+  useEffect(() => {
+    // skip the very first run — App already loaded the initial page
+    if (!didMount.current) { didMount.current = true; return }
+    onFetchPage({
+      offset: 0,
+      search: debouncedSearch,
+      sort: sortKey,
+      dir: sortDir,
+      subagents: showSubagents,
+      append: false,
+    })
+  }, [debouncedSearch, sortKey, sortDir, showSubagents, onFetchPage])
+
   const handleSort = (key) => {
+    if (!SERVER_SORTABLE.has(key)) return
     if (sortKey === key) setSortDir(d => (d === 'asc' ? 'desc' : 'asc'))
     else { setSortKey(key); setSortDir(key === 'updated' || key === 'created' ? 'desc' : 'asc') }
   }
 
-  const filtered = useMemo(() => {
-    const q = search.trim().toLowerCase()
-    let list = sessionList
-    if (!showSubagents) list = list.filter(s => !s.isSubagent)
-    if (q) {
-      list = list.filter(s =>
-        String(s.title || '').toLowerCase().includes(q) ||
-        String(s.directory || '').toLowerCase().includes(q) ||
-        String(s.model || '').toLowerCase().includes(q))
-    }
-    const dir = sortDir === 'asc' ? 1 : -1
-    return list.slice().sort((a, b) => {
-      let v1 = a[sortKey] ?? 0, v2 = b[sortKey] ?? 0
-      if (typeof v1 === 'string') { v1 = v1.toLowerCase(); v2 = String(v2).toLowerCase() }
-      return (v1 < v2 ? -1 : v1 > v2 ? 1 : 0) * dir
+  const loadMore = () => {
+    onFetchPage({
+      offset: sessionList.length,
+      search: debouncedSearch,
+      sort: sortKey,
+      dir: sortDir,
+      subagents: showSubagents,
+      append: true,
     })
-  }, [sessionList, search, showSubagents, sortKey, sortDir])
+  }
 
-  const maxCost = useMemo(() => filtered.reduce((mx, s) => Math.max(mx, s.cost || 0), 0) || 1, [filtered])
-  const subagentCount = useMemo(() => sessionList.filter(s => s.isSubagent).length, [sessionList])
+  // Rows come pre-filtered/sorted/paged from the server.
+  const rows = sessionList
+  const hasMore = rows.length < sessionTotal
+
+  const maxCost = useMemo(() => rows.reduce((mx, s) => Math.max(mx, s.cost || 0), 0) || 1, [rows])
 
   const toggleSelect = (id, e) => {
     e.stopPropagation()
@@ -60,12 +83,12 @@ export default function SessionList({
       return next
     })
   }
-  const selectAllFiltered = () => {
+  const selectAllShown = () => {
     setSelected(prev => {
       const next = new Set(prev)
-      const allShown = filtered.every(s => next.has(s.id))
-      if (allShown) filtered.forEach(s => next.delete(s.id))
-      else filtered.forEach(s => next.add(s.id))
+      const allShown = rows.every(s => next.has(s.id))
+      if (allShown) rows.forEach(s => next.delete(s.id))
+      else rows.forEach(s => next.add(s.id))
       return next
     })
   }
@@ -74,7 +97,7 @@ export default function SessionList({
   const scopeIds = Array.from(selected)
   const exportAll = scopeIds.length === 0
   const scopeLabel = exportAll
-    ? `all (${sessionList.length})`
+    ? `all (${sessionTotal})`
     : `${scopeIds.length} selected`
 
   const handleDrop = (e) => {
@@ -101,12 +124,16 @@ export default function SessionList({
         />
         <label className="sess-toggle">
           <input type="checkbox" checked={showSubagents} onChange={(e) => setShowSubagents(e.target.checked)} />
-          show subagents{subagentCount ? ` (${subagentCount})` : ''}
+          show subagents
         </label>
         <span className="sess-count">
-          {filtered.length} of {sessionList.length} sessions
+          {rows.length} of {sessionTotal} sessions
         </span>
-        <button className="btn" onClick={onRefresh} disabled={loadingList}>
+        <button
+          className="btn"
+          onClick={() => onFetchPage({ offset: 0, search: debouncedSearch, sort: sortKey, dir: sortDir, subagents: showSubagents, append: false })}
+          disabled={loadingList}
+        >
           {loadingList ? 'Loading…' : 'Refresh'}
         </button>
       </div>
@@ -130,22 +157,22 @@ export default function SessionList({
               <th className="sel-col">
                 <input
                   type="checkbox"
-                  checked={filtered.length > 0 && filtered.every(s => selected.has(s.id))}
-                  onChange={selectAllFiltered}
+                  checked={rows.length > 0 && rows.every(s => selected.has(s.id))}
+                  onChange={selectAllShown}
                   title="Select all shown"
                 />
               </th>
               {COLUMNS.map(col => (
                 <th
                   key={col.key}
-                  className={`sort-col${col.num ? ' num' : ''}${sortKey === col.key ? (sortDir === 'asc' ? ' asc' : ' desc') : ''}`}
+                  className={`${SERVER_SORTABLE.has(col.key) ? 'sort-col' : ''}${col.num ? ' num' : ''}${sortKey === col.key ? (sortDir === 'asc' ? ' asc' : ' desc') : ''}`}
                   onClick={() => handleSort(col.key)}
                 >{col.label}</th>
               ))}
             </tr>
           </thead>
           <tbody>
-            {filtered.map(s => {
+            {rows.map(s => {
               const w = Math.round((s.cost || 0) / maxCost * 100)
               return (
                 <tr key={s.id} className="sess-row" onClick={() => onLoadSession(s.id)} title={`Open: ${s.title}`}>
@@ -173,14 +200,22 @@ export default function SessionList({
                 </tr>
               )
             })}
-            {filtered.length === 0 && (
+            {rows.length === 0 && !loadingList && (
               <tr><td colSpan={COLUMNS.length + 1} className="sess-empty">
-                {sessionList.length ? 'No sessions match your filter.' : 'No sessions found. Drop trace files here to load them directly.'}
+                {debouncedSearch ? 'No sessions match your filter.' : 'No sessions found. Drop trace files here to load them directly.'}
               </td></tr>
             )}
           </tbody>
         </table>
       </div>
+
+      {hasMore && (
+        <div className="sess-more">
+          <button className="btn" onClick={loadMore} disabled={loadingMore}>
+            {loadingMore ? 'Loading…' : `Load ${Math.min(pageSize, sessionTotal - rows.length)} more`}
+          </button>
+        </div>
+      )}
 
       <p className="sess-hint">
         Click any session to view its trace anatomy. Drop JSON/JSONL trace files anywhere to load from disk.
