@@ -65,3 +65,8 @@ results-*.jsonl
 
 **.jsonl
 !eval/eval-tasks.jsonl
+
+# Outputs
+outputs/
+eval/
+unsloth_compiled_cache/
