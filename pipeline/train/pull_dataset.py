@@ -6,18 +6,16 @@ sessions), so we deterministically hold out --eval-frac of it for evaluation.
 The eval split is also what eval/harvest_eval_tasks.py turns into held-out
 opencode-harness tasks, so the same rows are never trained on and evaluated.
 
-Every pull is scrubbed through build_dataset.py's cleaning steps so a stale or
-dirty HF snapshot can never poison a training run:
+Every pull is scrubbed through build_dataset.py's full cleaning pipeline so a
+stale or dirty HF snapshot can never poison a training run:
 
-  1. decontaminate — drop rows overlapping the held-out agent-problem-pack:
-     build_dataset's n-gram index over the pack sources PLUS the pack's
-     check_contamination marker gate. Needs the repo clone's
-     agent-problem-pack/ next to pipeline/ (present on any pod that cloned the
-     repo); a missing pack only warns loudly. --no-decontam skips both.
-  2. sanitize — rewrite the teacher model identity in system prompts (e.g.
-     "You are powered by the model named north-mini-code") to the model being
-     trained (--model-name, default Qwen3.6) and normalize worktree paths, so
-     the student is never taught to claim it is a previous training target.
+  1. dedupe — collapse prefix/duplicate sessions to the longest trajectory
+  2. apply_filters — drop corrections, malformed/looping tools, incomplete
+     exports, empty subagent results, trivial zero-tool readiness replies, and
+     over-length samples
+  3. decontaminate — drop rows overlapping the held-out agent-problem-pack
+  4. check_contamination marker gate (when pack scripts are present)
+  5. sanitize — rewrite teacher model identity + replay worktree paths
 
 Usage on the pod:
     export HF_TOKEN=...read-only-token...   # only needed for private repos
@@ -48,27 +46,22 @@ def _build_dataset_module():
     return build_dataset
 
 
-def drop_marker_hits(rows: list[dict], pack_root: Path) -> list[dict]:
-    """Apply the pack's check_contamination marker gate on top of the n-gram
-    decontam: it catches traces that *discuss* a problem (symbol names, prompt
-    phrases) without quoting 13 contiguous tokens of its source."""
-    scripts_dir = Path(pack_root) / "scripts"
-    if not (scripts_dir / "check_contamination.py").is_file():
-        print(f"  markers: SKIPPED — {scripts_dir}/check_contamination.py "
-              f"not found", file=sys.stderr)
-        return rows
-    if str(scripts_dir) not in sys.path:
-        sys.path.insert(0, str(scripts_dir))
-    from check_contamination import scan_row
-    kept, dropped = [], 0
-    for row in rows:
-        if scan_row(json.dumps(row)):
-            dropped += 1
-        else:
-            kept.append(row)
-    print(f"  markers: kept {len(kept)}, dropped {dropped} "
-          f"(check_contamination gate)")
-    return kept
+def clean_rows(rows: list[dict], model_name: str, workspace: str = "/workspace",
+               pack_root: Path | None = None, decontam: bool = True,
+               decontam_ngram: int = 13, do_sanitize: bool = True,
+               max_tokens: int = 64000) -> list[dict]:
+    """Run the same dedup/filter/decontam/sanitize path as build_dataset.py."""
+    bd = _build_dataset_module()
+    return bd.clean_sft_records(
+        rows,
+        max_tokens=max_tokens,
+        model_name=model_name,
+        workspace=workspace,
+        pack_root=pack_root or bd.DEFAULT_PACK_ROOT,
+        decontam=decontam,
+        decontam_ngram=decontam_ngram,
+        do_sanitize=do_sanitize,
+    )
 
 
 def normalize_tool_args(messages):
@@ -128,20 +121,6 @@ def fetch_repo_rows(repo: str) -> tuple[list[dict], list[dict] | None]:
     return train_rows, eval_rows
 
 
-def clean_rows(rows: list[dict], model_name: str, workspace: str = "/workspace",
-               pack_root: Path | None = None, decontam: bool = True,
-               decontam_ngram: int = 13, do_sanitize: bool = True) -> list[dict]:
-    """Benchmark-decontaminate and identity-sanitize pulled rows in one pass."""
-    bd = _build_dataset_module()
-    root = (pack_root or bd.DEFAULT_PACK_ROOT) if decontam else None
-    rows = bd.decontaminate(rows, root, n=decontam_ngram)
-    if root is not None and Path(root).is_dir():
-        rows = drop_marker_hits(rows, Path(root))
-    if do_sanitize:
-        rows = bd.sanitize(rows, model_name, workspace)
-    return rows
-
-
 def write_split(rows: list[dict], out_path: Path) -> int:
     with out_path.open("w") as f:
         for row in rows:
@@ -153,6 +132,7 @@ def pull_split_clean(repo: str, out: Path, eval_frac: float, model_name: str,
                      workspace: str = "/workspace",
                      pack_root: Path | None = None, decontam: bool = True,
                      decontam_ngram: int = 13, do_sanitize: bool = True,
+                     max_tokens: int = 64000,
                      ) -> tuple[Path, Path]:
     """Pull `repo`, clean it, and write out/sft.jsonl + out/sft-eval.jsonl.
     Also used by train.py --hf-repo so both download paths stay clean."""
@@ -161,13 +141,16 @@ def pull_split_clean(repo: str, out: Path, eval_frac: float, model_name: str,
     if eval_rows is not None:
         print("  using existing train + eval splits")
         train_rows = clean_rows(train_rows, model_name, workspace,
-                                pack_root, decontam, decontam_ngram, do_sanitize)
+                                pack_root, decontam, decontam_ngram, do_sanitize,
+                                max_tokens)
         eval_rows = clean_rows(eval_rows, model_name, workspace,
-                               pack_root, decontam, decontam_ngram, do_sanitize)
+                               pack_root, decontam, decontam_ngram, do_sanitize,
+                               max_tokens)
     else:
         # Clean BEFORE splitting so decontam-dropped rows can't skew the split.
         rows = clean_rows(train_rows, model_name, workspace,
-                          pack_root, decontam, decontam_ngram, do_sanitize)
+                          pack_root, decontam, decontam_ngram, do_sanitize,
+                          max_tokens)
         indices = list(range(len(rows)))
         random.Random(0).shuffle(indices)
         n_eval = max(1, round(len(rows) * eval_frac)) if rows else 0
@@ -223,6 +206,9 @@ def main():
     p.add_argument("--repo", default="nkasmanoff/opencode-sft")
     p.add_argument("--out", type=Path, default=Path("dataset"))
     p.add_argument("--eval-frac", type=float, default=0.1)
+    p.add_argument("--max-tokens", type=int, default=64000,
+                   help="approximate per-sample cap (chars/4); set below "
+                        "train.py --max-seq-len")
     p.add_argument("--base", default=QWEN_BASE,
                    help="model id used for the rendering sanity check")
     p.add_argument("--model-name", default=None,
@@ -249,6 +235,7 @@ def main():
         decontam=not args.no_decontam,
         decontam_ngram=args.decontam_ngram,
         do_sanitize=not args.no_sanitize,
+        max_tokens=args.max_tokens,
     )
 
     first = data_path.read_text().splitlines()[0]

@@ -109,10 +109,11 @@ make eval-tasks                      # replay them on the served model
 ## Dataset quality gate
 
 `dataset/build_dataset.py` applies filters shared by both the viewer export
-path (shells out via `--sft-input`) and the legacy proxy-log build:
+path (shells out via `--sft-input`) and the HF pull path (`pull_dataset.py`):
 
-- drops sessions ending in a user correction/complaint
-- drops malformed tool calls
-- drops tool-call loops (same call 3+ times)
-- drops samples over the token cap
 - deduplicates identical/prefix trajectories
+- drops sessions ending in a user correction/complaint
+- drops malformed tool calls and tool-call loops
+- drops incomplete exports and vacuous endings (empty assistant, empty subagent)
+- drops agentic sessions with zero tool calls (tools present but never used)
+- drops samples over the token cap

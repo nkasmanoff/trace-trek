@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """LoRA fine-tune a local code model on collected traces. Runs on a CUDA GPU.
 
-Defaults to `Qwen/Qwen3.6-35B-A3B` (35B-total / 3B-active hybrid MoE). Tries
-Unsloth first (handles the multimodal model's text-only path, the MoE kernels,
+Defaults to `Qwen/Qwen3.6-27B` (dense 27B, hybrid Gated DeltaNet + full
+attention). Tries Unsloth first (handles the multimodal model's text-only path
 and gradient checkpointing); falls back to plain transformers + PEFT + TRL.
 
 Loss is masked to assistant turns only. When a chat template marks assistant
@@ -35,21 +35,21 @@ import copy
 import json
 from pathlib import Path
 
-# Default base. Qwen3.6-35B-A3B is a 35B-total / 3B-active hybrid MoE
-# (~30 Gated DeltaNet linear-attention layers + ~10 standard attention layers +
-# 256 experts). bf16 LoRA fits one 80GB H100 (~74GB), which is why the default
-# is bf16 (`--quant none`): bitsandbytes 4-bit QLoRA is *not recommended* for
-# this MoE family (large quantization error / instability), and the fused
-# experts don't quantize cleanly anyway. An FP8 build exists for tighter VRAM.
-QWEN_BASE = "Qwen/Qwen3.6-35B-A3B"
-QWEN_FP8_BASE = "Qwen/Qwen3.6-35B-A3B-FP8"
+# Default base. Qwen3.6-27B is a dense 27B model with a hybrid architecture:
+# 48 Gated DeltaNet (linear-attention) layers interleaved with 16 standard full-
+# attention layers. No MoE experts. bf16 LoRA fits one 80GB H100 with room to
+# spare (~54GB base). 4-bit QLoRA (--quant 4bit) also works well for the dense
+# architecture (no fused MoE experts to block bitsandbytes quantization).
+QWEN_BASE = "Qwen/Qwen3.6-27B"
+QWEN_FP8_BASE = "Qwen/Qwen3.6-27B"
 
 # Legacy Laguna bases (still selectable via --base).
 LAGUNA_BASE = "poolside/Laguna-XS.2"
 # FP8 (compressed-tensors) build: the MoE experts are FP8-compressed while the
 # attention projections stay bf16, so the model fits on one 80GB H100 and LoRA
 # wraps the un-quantized attention linears. Plain bitsandbytes 4-bit can't
-# quantize Laguna's fused `LagunaExperts` module (94% of params).
+# quantize Laguna's fused `LagunaExperts` module (94% of params). Not relevant
+# for the dense Qwen3.6-27B default; kept for legacy --base selection.
 LAGUNA_FP8_BASE = "poolside/Laguna-XS.2-FP8"
 
 # Only train on trajectories produced by strong teacher models. Rows whose
@@ -154,9 +154,9 @@ def parse_args() -> argparse.Namespace:
                    default="auto",
                    help="base-model quantization. auto: 'fp8' (native "
                         "compressed-tensors) for *-FP8 repos; 'none' (bf16 LoRA) "
-                        "for Qwen MoE (4-bit QLoRA is discouraged there); else "
-                        "'4bit' (bitsandbytes QLoRA). 'none' bf16 fits one 80GB "
-                        "H100 for Qwen3.6-35B-A3B; shards across GPUs otherwise.")
+                        "for Qwen (bf16 fits one 80GB H100 for 27B); "
+                        "'4bit' (bitsandbytes QLoRA) also works on the dense "
+                        "27B. 'none' fits one 80GB H100; shards otherwise.")
     p.add_argument("--chat-format", choices=["auto", "qwen", "laguna", "cohere"],
                    default="auto",
                    help="chat template family (auto-detected from --base)")
@@ -255,7 +255,8 @@ def resolve_quant(args) -> str:
     base = (args.base or "").lower()
     if "fp8" in base or "compressed" in base:
         return "fp8"
-    # bf16 LoRA for Qwen MoE: 4-bit QLoRA is discouraged for this family.
+    # bf16 LoRA for Qwen (fits one 80GB H100 for the dense 27B);
+    # 4-bit QLoRA (--quant 4bit) also works on this dense architecture.
     if "qwen" in base:
         return "none"
     return "4bit"
@@ -313,10 +314,10 @@ def setup_wandb(args, fmt: str, n_train: int, n_eval: int) -> str | None:
 _ATTN_TARGETS = {
     "laguna": ["q_proj", "k_proj", "v_proj", "o_proj"],
     "cohere": ["q_proj", "k_proj", "v_proj", "o_proj"],
-    # Qwen3.6 is hybrid: ~30 Gated DeltaNet (linear-attention) layers + ~10
-    # standard attention layers. q/k/v/o_proj only reach the 10 standard layers
-    # (~0.02% of params) and training NaNs — we MUST also adapt the DeltaNet
-    # linear_attn projections (in_proj_qkv / in_proj_z / out_proj).
+    # Qwen3.6-27B is hybrid: 48 Gated DeltaNet (linear-attention) layers + 16
+    # standard full-attention layers. q/k/v/o_proj only reach the 16 standard
+    # layers (~0.02% of params) and training NaNs — we MUST also adapt the
+    # DeltaNet linear_attn projections (in_proj_qkv / in_proj_z / out_proj).
     "qwen": ["q_proj", "k_proj", "v_proj", "o_proj",
              "in_proj_qkv", "in_proj_z", "out_proj"],
 }
@@ -324,7 +325,7 @@ _ATTN_TARGETS = {
 _MLP_TARGETS = {
     "laguna": ["gate_proj", "up_proj", "down_proj"],
     "cohere": ["gate_proj", "up_proj", "down_proj"],
-    "qwen": ["gate_proj", "up_proj", "down_proj"],  # MoE switch_mlp experts
+    "qwen": ["gate_proj", "up_proj", "down_proj"],  # FFN projections (SwiGLU)
 }
 
 
@@ -594,9 +595,9 @@ class MaskedCollator:
 
 def try_unsloth(args, fmt: str, load_in_4bit: bool):
     """Return (model, tokenizer, is_unsloth) or raise. `load_in_4bit=False`
-    loads bf16/16-bit (the recommended path for Qwen MoE)."""
+    loads bf16/16-bit (bf16 is fine for the dense 27B; 4-bit also works)."""
     try:
-        # FastModel handles MoE / multimodal (text-only) bases; fall back to
+        # FastModel handles multimodal (text-only) bases; fall back to
         # FastLanguageModel for plain text architectures.
         from unsloth import FastModel as _Fast
     except Exception:  # noqa: BLE001
@@ -831,16 +832,87 @@ def apply_liger_qwen3_5_moe(model) -> bool:
     return True
 
 
+def apply_liger_qwen3_5(model) -> bool:
+    """Patch Qwen3_5ForCausalLM to compute the LM loss with Liger's fused linear
+    cross-entropy. Qwen3.6-27B's vocab is ~248k, so the forward's [seq, 248k]
+    logits tensor is the single biggest VRAM consumer at long context — ~80GB at
+    82k tokens. Liger fuses the lm_head matmul + cross-entropy so the full logits
+    tensor is never built. Returns True if applied."""
+    if "qwen3_5" not in getattr(model.config, "model_type", ""):
+        return False
+    if "moe" in getattr(model.config, "model_type", ""):
+        return False  # MoE variant handled by apply_liger_qwen3_5_moe
+    try:
+        from liger_kernel.transformers.model.loss_utils import (
+            LigerForCausalLMLoss, unpack_cross_entropy_result)
+        from transformers.modeling_outputs import CausalLMOutputWithPast
+        from transformers.models.qwen3_5 import modeling_qwen3_5 as mq
+    except Exception as exc:  # noqa: BLE001
+        print(f"liger: unavailable ({exc!r}); using standard loss")
+        return False
+
+    def lce_forward(self, input_ids=None, attention_mask=None, position_ids=None,
+                    past_key_values=None, inputs_embeds=None, labels=None,
+                    use_cache=None, logits_to_keep=0, **kwargs):
+        # TRL passes these to control metrics; keep them out of the base model
+        return_token_accuracy = kwargs.pop("return_token_accuracy", False)
+        kwargs.pop("use_token_scaling", None)
+        shift_labels = kwargs.pop("shift_labels", None)
+        skip_logits = kwargs.pop("skip_logits", None)
+
+        outputs = self.model(
+            input_ids=input_ids, attention_mask=attention_mask,
+            position_ids=position_ids, past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds, use_cache=use_cache, **kwargs,
+        )
+        hidden_states = outputs.last_hidden_state
+        slice_indices = (slice(-logits_to_keep, None)
+                         if isinstance(logits_to_keep, int) else logits_to_keep)
+        kept = hidden_states[:, slice_indices, :]
+
+        logits = loss = token_accuracy = predicted_tokens = None
+        if skip_logits is None:
+            skip_logits = labels is not None or shift_labels is not None
+        if skip_logits:
+            result = LigerForCausalLMLoss(
+                hidden_states=kept, lm_head_weight=self.lm_head.weight,
+                labels=labels, shift_labels=shift_labels,
+                hidden_size=self.config.hidden_size,
+                return_token_accuracy=return_token_accuracy, **kwargs)
+            loss, _, token_accuracy, predicted_tokens = \
+                unpack_cross_entropy_result(result)
+        else:
+            logits = self.lm_head(kept)
+            if labels is not None or shift_labels is not None:
+                loss = self.loss_function(
+                    logits=logits, labels=labels, shift_labels=shift_labels,
+                    vocab_size=self.vocab_size, **kwargs)
+
+        output = CausalLMOutputWithPast(
+            loss=loss, logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+        output.token_accuracy = token_accuracy
+        output.predicted_tokens = predicted_tokens
+        return output
+
+    mq.Qwen3_5ForCausalLM.forward = lce_forward
+    return True
+
+
 def load_lora(args, fmt: str):
     """LoRA on a model loaded in its native precision (no bitsandbytes).
 
-    Used for the FP8 compressed-tensors build (experts stay FP8-compressed, the
-    attention projections we adapt stay bf16) and for plain bf16 (--quant none).
-    Gradient checkpointing keeps activation memory in check at long context.
+    Used for FP8 compressed-tensors builds (legacy Laguna path) and for plain
+    bf16 (--quant none). Gradient checkpointing keeps activation memory in check
+    at long context.
 
-    Note: Qwen3.6 is a multimodal (image-text-to-text) checkpoint. We load the
-    text path for text-only SFT; if `AutoModelForCausalLM` can't materialize the
-    text model directly, prefer the Unsloth path (handled by the caller)."""
+    Note: Qwen3.6-27B is a multimodal (image-text-to-text) checkpoint. We load
+    the text-only path via AutoModelForCausalLM for text-only SFT; if this can't
+    materialize the text model directly, prefer the Unsloth path (handled by the
+    caller)."""
     import torch
     from peft import get_peft_model
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -848,11 +920,9 @@ def load_lora(args, fmt: str):
     tokenizer = AutoTokenizer.from_pretrained(args.base)
     # transformers reads the FP8 build's own quantization_config
     # (compressed-tensors); a plain bf16 repo just loads in bf16.
-    # `experts_implementation="grouped_mm"` is essential for the Qwen MoE: the
-    # default `batched_mm` path gathers a per-token copy of every selected
-    # expert's weights (`gate_up_proj[expert_ids]`), which blows up to ~88GB and
-    # OOMs even at short context. grouped_mm sorts tokens by expert and uses
-    # torch._grouped_mm (Hopper SM90+/torch>=2.9), so no per-token weight copy.
+    # `experts_implementation="grouped_mm"` is only relevant for MoE models
+    # (Laguna, Qwen MoE variants); the dense Qwen3.6-27B has no MoE experts so
+    # it's silently ignored by the loader. We try it for legacy --base compat.
     load_kwargs = dict(
         dtype=torch.bfloat16,
         device_map="auto",
@@ -1163,10 +1233,11 @@ def main() -> None:
     if args.data is None:
         raise SystemExit("provide --data or --hf-repo")
 
-    # Qwen3.6 (a hybrid MoE / multimodal checkpoint) loads most reliably through
-    # Unsloth — it handles the text-only path, MoE kernels, and the DeltaNet
-    # LoRA targets. We try Unsloth first for both bf16 (`none`) and 4-bit Qwen,
-    # falling back to transformers. Other bases keep the original routing.
+    # Qwen3.6-27B (a dense hybrid DeltaNet / full-attention multimodal
+    # checkpoint) loads most reliably through Unsloth — it handles the text-only
+    # path, the DeltaNet LoRA targets, and gradient checkpointing. We try Unsloth
+    # first for both bf16 (`none`) and 4-bit Qwen, falling back to transformers.
+    # Other bases keep the original routing.
     prefer_unsloth = quant == "4bit" or (fmt == "qwen" and quant == "none")
     if prefer_unsloth:
         load_in_4bit = quant == "4bit"
@@ -1189,7 +1260,7 @@ def main() -> None:
 
     liger_on = False
     if not args.no_liger and not is_unsloth:
-        liger_on = apply_liger_laguna(model) or apply_liger_qwen3_5_moe(model)
+        liger_on = apply_liger_laguna(model) or apply_liger_qwen3_5_moe(model) or apply_liger_qwen3_5(model)
         print("liger: fused linear cross-entropy enabled (frees logits VRAM)"
               if liger_on else "liger: not applied (unknown arch); standard loss")
 
