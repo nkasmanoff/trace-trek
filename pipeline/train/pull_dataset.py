@@ -9,13 +9,13 @@ opencode-harness tasks, so the same rows are never trained on and evaluated.
 Every pull is scrubbed through build_dataset.py's full cleaning pipeline so a
 stale or dirty HF snapshot can never poison a training run:
 
-  1. dedupe — collapse prefix/duplicate sessions to the longest trajectory
-  2. apply_filters — drop corrections, malformed/looping tools, incomplete
+  1. apply_filters — drop corrections, malformed/looping tools, incomplete
      exports, empty subagent results, trivial zero-tool readiness replies, and
      over-length samples
-  3. decontaminate — drop rows overlapping the held-out agent-problem-pack
-  4. check_contamination marker gate (when pack scripts are present)
-  5. sanitize — rewrite teacher model identity + replay worktree paths
+  2. sanitize — rewrite teacher model identity + replay worktree paths
+  3. dedupe — collapse prefix/duplicate sessions to the longest trajectory
+  4. decontaminate — drop rows overlapping the held-out agent-problem-pack
+  5. check_contamination marker gate (when pack scripts are present)
 
 Usage on the pod:
     export HF_TOKEN=...read-only-token...   # only needed for private repos

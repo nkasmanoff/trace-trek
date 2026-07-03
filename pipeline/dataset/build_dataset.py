@@ -493,11 +493,10 @@ def clean_sft_records(
     do_sanitize: bool = True,
 ) -> list[dict]:
     """Run dedup/filter/decontam/sanitize on already-built SFT records."""
-    del decontam_ngram  # decontaminate uses module-level NGRAM_SIZE
     samples = apply_filters(list(rows), max_tokens)
-    samples = dedupe_prefix(samples)
     if do_sanitize:
         samples = sanitize(samples, model_name, workspace)
+    samples = dedupe_prefix(samples)
     if decontam:
         samples = decontaminate(samples, pack_root or PACK_ROOT)
     return _drop_marker_contaminated(samples)
