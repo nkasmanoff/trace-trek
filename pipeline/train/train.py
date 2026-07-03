@@ -1250,7 +1250,7 @@ class IntermittentEvalCallback:
             metrics["eval_gate/pack_mean_steps"] = pack["mean_steps"]
         if pack.get("mean_tokens") is not None:
             metrics["eval_gate/pack_mean_tokens"] = pack["mean_tokens"]
-        wandb.log(metrics, step=step)
+        wandb.log(metrics, commit=False)
         rate = metrics.get("eval_gate/pack_pass_rate")
         print(f"[eval-gate] step {step} ({when}) pack -> "
               f"pass_rate={rate:.3f}" if rate is not None
@@ -1271,7 +1271,7 @@ class IntermittentEvalCallback:
             metrics[f"eval_gate/{section}_total"] = total
             if total:
                 metrics[f"eval_gate/{section}_rate"] = passed / total
-        wandb.log(metrics, step=step)
+        wandb.log(metrics, commit=False)
         summary = "  ".join(f"{k.split('/')[-1]}={v}" for k, v in metrics.items()
                             if k.endswith("_rate"))
         print(f"[eval-gate] step {step} ({when}) -> {summary or 'logged'}")
