@@ -1275,8 +1275,12 @@ def main() -> None:
             else:
                 model, tokenizer, is_unsloth = load_lora(args, fmt)
     else:
-        model, tokenizer, is_unsloth = load_lora(args, fmt)
-        print(f"== {quant} LoRA (no bitsandbytes) ==")
+        if quant == "4bit":
+            model, tokenizer, is_unsloth = load_4bit(args, fmt)
+            print("== 4bit LoRA ==")
+        else:
+            model, tokenizer, is_unsloth = load_lora(args, fmt)
+            print(f"== {quant} LoRA (no bitsandbytes) ==")
     tokenizer = normalize_text_tokenizer(tokenizer)
     # Unsloth sets up its own gradient checkpointing; the native-precision LoRA
     # and transformers QLoRA paths need the trainer to enable it.
