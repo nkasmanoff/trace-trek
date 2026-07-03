@@ -1,10 +1,10 @@
 """Serve a model over the in-process OpenAI-compatible server and run the FULL
-14-problem agent-problem-pack against it. Used post-training to measure the
-start (base) vs latest (merged) pack pass rate on the complete benchmark.
+agent-problem-pack against it. Used post-training to measure the start (base) vs
+latest (merged) pack pass rate on the complete benchmark.
 
 Usage:
-    python run_full_bench.py --model-path Qwen/Qwen3.6-35B-A3B --tag start
-    python run_full_bench.py --model-path ../outputs/merged    --tag latest
+    python run_full_bench.py --model-path Qwen/Qwen3.6-27B --tag baseline
+    python run_full_bench.py --model-path ../outputs/merged --tag lora-merged
 """
 from __future__ import annotations
 
@@ -45,11 +45,16 @@ def main() -> None:
 
     print(f"[{args.tag}] loading {args.model_path} ...", flush=True)
     tok = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_path, dtype=torch.bfloat16, device_map="auto",
-        attn_implementation="sdpa", experts_implementation="grouped_mm",
+    load_kwargs = dict(
+        dtype=torch.bfloat16,
+        device_map="auto",
+        attn_implementation="sdpa",
         trust_remote_code=True,
     )
+    # MoE-only; dense Qwen3.6-27B rejects this kwarg.
+    if any(x in args.model_path.lower() for x in ("a3b", "moe", "35b-a3b")):
+        load_kwargs["experts_implementation"] = "grouped_mm"
+    model = AutoModelForCausalLM.from_pretrained(args.model_path, **load_kwargs)
     model.eval()
     model.config.use_cache = True
     # router logits during cached generation crash on shape mismatch; off for eval

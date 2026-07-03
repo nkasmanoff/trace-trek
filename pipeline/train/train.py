@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """LoRA fine-tune a local code model on collected traces. Runs on a CUDA GPU.
 
-Defaults to `Qwen/Qwen3.6-27B` (dense 27B, hybrid Gated DeltaNet + full
-attention). Tries Unsloth first (handles the multimodal model's text-only path
+Defaults to `Qwen/Qwen3.6-35B-A3B` (35B-total / 3B-active hybrid MoE). Tries
+Unsloth first (handles the multimodal model's text-only path, the MoE kernels,
 and gradient checkpointing); falls back to plain transformers + PEFT + TRL.
 
 Loss is masked to assistant turns only. When a chat template marks assistant
@@ -35,21 +35,21 @@ import copy
 import json
 from pathlib import Path
 
-# Default base. Qwen3.6-27B is a dense 27B model with a hybrid architecture:
-# 48 Gated DeltaNet (linear-attention) layers interleaved with 16 standard full-
-# attention layers. No MoE experts. bf16 LoRA fits one 80GB H100 with room to
-# spare (~54GB base). 4-bit QLoRA (--quant 4bit) also works well for the dense
-# architecture (no fused MoE experts to block bitsandbytes quantization).
-QWEN_BASE = "Qwen/Qwen3.6-27B"
-QWEN_FP8_BASE = "Qwen/Qwen3.6-27B"
+# Default base. Qwen3.6-35B-A3B is a 35B-total / 3B-active hybrid MoE
+# (~30 Gated DeltaNet linear-attention layers + ~10 standard attention layers +
+# 256 experts). bf16 LoRA fits one 80GB H100 (~74GB), which is why the default
+# is bf16 (`--quant none`): bitsandbytes 4-bit QLoRA is *not recommended* for
+# this MoE family (large quantization error / instability), and the fused
+# experts don't quantize cleanly anyway. An FP8 build exists for tighter VRAM.
+QWEN_BASE = "Qwen/Qwen3.6-35B-A3B"
+QWEN_FP8_BASE = "Qwen/Qwen3.6-35B-A3B-FP8"
 
 # Legacy Laguna bases (still selectable via --base).
 LAGUNA_BASE = "poolside/Laguna-XS.2"
 # FP8 (compressed-tensors) build: the MoE experts are FP8-compressed while the
 # attention projections stay bf16, so the model fits on one 80GB H100 and LoRA
 # wraps the un-quantized attention linears. Plain bitsandbytes 4-bit can't
-# quantize Laguna's fused `LagunaExperts` module (94% of params). Not relevant
-# for the dense Qwen3.6-27B default; kept for legacy --base selection.
+# quantize Laguna's fused `LagunaExperts` module (94% of params).
 LAGUNA_FP8_BASE = "poolside/Laguna-XS.2-FP8"
 
 # Only train on trajectories produced by strong teacher models. Rows whose
@@ -141,6 +141,8 @@ def parse_args() -> argparse.Namespace:
                    help="when --hf-repo has only a train split, hold out this "
                         "fraction for eval")
     p.add_argument("--eval-steps", type=int, default=20)
+    p.add_argument("--no-eval", action="store_true",
+                   help="skip held-out eval loss (avoids VRAM spike on long context)")
     p.add_argument("--allow-models", default=",".join(DEFAULT_ALLOWED_MODELS),
                    help="comma-separated substrings of teacher model ids to "
                         "train on (matched case-insensitively against each "
@@ -153,10 +155,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--quant", choices=["auto", "fp8", "4bit", "none"],
                    default="auto",
                    help="base-model quantization. auto: 'fp8' (native "
-                        "compressed-tensors) for *-FP8 repos; 'none' (bf16 LoRA) "
-                        "for Qwen (bf16 fits one 80GB H100 for 27B); "
-                        "'4bit' (bitsandbytes QLoRA) also works on the dense "
-                        "27B. 'none' fits one 80GB H100; shards otherwise.")
+                         "compressed-tensors) for *-FP8 repos; 'none' (bf16 LoRA) "
+                         "for Qwen MoE (4-bit QLoRA is discouraged for this MoE "
+                         "family); '4bit' (bitsandbytes QLoRA) for dense models. "
+                         "'none' bf16 fits one 80GB H100 for Qwen3.6-35B-A3B; "
+                         "shards across GPUs otherwise.")
     p.add_argument("--chat-format", choices=["auto", "qwen", "laguna", "cohere"],
                    default="auto",
                    help="chat template family (auto-detected from --base)")
@@ -249,14 +252,21 @@ def load_dotenv(start: Path) -> None:
             return
 
 
+def normalize_text_tokenizer(tokenizer):
+    """Qwen loads as a multimodal Processor; SFT needs the text tokenizer."""
+    inner = getattr(tokenizer, "tokenizer", None)
+    if inner is not None and hasattr(inner, "apply_chat_template"):
+        return inner
+    return tokenizer
+
+
 def resolve_quant(args) -> str:
     if args.quant != "auto":
         return args.quant
     base = (args.base or "").lower()
     if "fp8" in base or "compressed" in base:
         return "fp8"
-    # bf16 LoRA for Qwen (fits one 80GB H100 for the dense 27B);
-    # 4-bit QLoRA (--quant 4bit) also works on this dense architecture.
+    # bf16 LoRA for Qwen: 4-bit QLoRA is discouraged for the MoE (A3B) family.
     if "qwen" in base:
         return "none"
     return "4bit"
@@ -314,10 +324,10 @@ def setup_wandb(args, fmt: str, n_train: int, n_eval: int) -> str | None:
 _ATTN_TARGETS = {
     "laguna": ["q_proj", "k_proj", "v_proj", "o_proj"],
     "cohere": ["q_proj", "k_proj", "v_proj", "o_proj"],
-    # Qwen3.6-27B is hybrid: 48 Gated DeltaNet (linear-attention) layers + 16
-    # standard full-attention layers. q/k/v/o_proj only reach the 16 standard
-    # layers (~0.02% of params) and training NaNs — we MUST also adapt the
-    # DeltaNet linear_attn projections (in_proj_qkv / in_proj_z / out_proj).
+    # Qwen3.6 is hybrid: ~30 Gated DeltaNet (linear-attention) layers + ~10
+    # standard attention layers. q/k/v/o_proj only reach the 10 standard layers
+    # (~0.02% of params) and training NaNs — we MUST also adapt the DeltaNet
+    # linear_attn projections (in_proj_qkv / in_proj_z / out_proj).
     "qwen": ["q_proj", "k_proj", "v_proj", "o_proj",
              "in_proj_qkv", "in_proj_z", "out_proj"],
 }
@@ -325,7 +335,7 @@ _ATTN_TARGETS = {
 _MLP_TARGETS = {
     "laguna": ["gate_proj", "up_proj", "down_proj"],
     "cohere": ["gate_proj", "up_proj", "down_proj"],
-    "qwen": ["gate_proj", "up_proj", "down_proj"],  # FFN projections (SwiGLU)
+    "qwen": ["gate_proj", "up_proj", "down_proj"],  # MoE switch_mlp experts
 }
 
 
@@ -595,7 +605,7 @@ class MaskedCollator:
 
 def try_unsloth(args, fmt: str, load_in_4bit: bool):
     """Return (model, tokenizer, is_unsloth) or raise. `load_in_4bit=False`
-    loads bf16/16-bit (bf16 is fine for the dense 27B; 4-bit also works)."""
+    loads bf16/16-bit (the recommended path for Qwen MoE)."""
     try:
         # FastModel handles multimodal (text-only) bases; fall back to
         # FastLanguageModel for plain text architectures.
@@ -905,24 +915,22 @@ def apply_liger_qwen3_5(model) -> bool:
 def load_lora(args, fmt: str):
     """LoRA on a model loaded in its native precision (no bitsandbytes).
 
-    Used for FP8 compressed-tensors builds (legacy Laguna path) and for plain
-    bf16 (--quant none). Gradient checkpointing keeps activation memory in check
-    at long context.
+    Used for FP8 compressed-tensors builds and for plain bf16 (--quant none).
+    Gradient checkpointing keeps activation memory in check at long context.
 
-    Note: Qwen3.6-27B is a multimodal (image-text-to-text) checkpoint. We load
-    the text-only path via AutoModelForCausalLM for text-only SFT; if this can't
-    materialize the text model directly, prefer the Unsloth path (handled by the
-    caller)."""
+    Note: Qwen3.6 is a multimodal (image-text-to-text) checkpoint. We load the
+    text path for text-only SFT; if `AutoModelForCausalLM` can't materialize the
+    text model directly, prefer the Unsloth path (handled by the caller)."""
     import torch
     from peft import get_peft_model
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(args.base)
-    # transformers reads the FP8 build's own quantization_config
-    # (compressed-tensors); a plain bf16 repo just loads in bf16.
-    # `experts_implementation="grouped_mm"` is only relevant for MoE models
-    # (Laguna, Qwen MoE variants); the dense Qwen3.6-27B has no MoE experts so
-    # it's silently ignored by the loader. We try it for legacy --base compat.
+    # `experts_implementation="grouped_mm"` is essential for the Qwen MoE: the
+    # default `batched_mm` path gathers a per-token copy of every selected
+    # expert's weights, which blows up VRAM. grouped_mm sorts tokens by expert
+    # and uses torch._grouped_mm (Hopper SM90+/torch>=2.9), so no per-token
+    # weight copy. For dense models it's silently ignored by the loader.
     load_kwargs = dict(
         dtype=torch.bfloat16,
         device_map="auto",
@@ -936,6 +944,9 @@ def load_lora(args, fmt: str):
         print(f"experts: grouped_mm unavailable ({exc!r}); using default")
         model = AutoModelForCausalLM.from_pretrained(args.base, **load_kwargs)
     model.config.use_cache = False
+    # MoE aux-loss tensors blow VRAM at long context during LoRA SFT.
+    if hasattr(model.config, "output_router_logits"):
+        model.config.output_router_logits = False
     # needed so gradients reach LoRA params through a frozen/quantized base
     # when gradient checkpointing is on
     model.enable_input_require_grads()
@@ -1233,11 +1244,10 @@ def main() -> None:
     if args.data is None:
         raise SystemExit("provide --data or --hf-repo")
 
-    # Qwen3.6-27B (a dense hybrid DeltaNet / full-attention multimodal
-    # checkpoint) loads most reliably through Unsloth — it handles the text-only
-    # path, the DeltaNet LoRA targets, and gradient checkpointing. We try Unsloth
-    # first for both bf16 (`none`) and 4-bit Qwen, falling back to transformers.
-    # Other bases keep the original routing.
+    # Qwen3.6 (a hybrid MoE / multimodal checkpoint) loads most reliably through
+    # Unsloth — it handles the text-only path, MoE kernels, and the DeltaNet
+    # LoRA targets. We try Unsloth first for both bf16 (`none`) and 4-bit Qwen,
+    # falling back to transformers. Other bases keep the original routing.
     prefer_unsloth = quant == "4bit" or (fmt == "qwen" and quant == "none")
     if prefer_unsloth:
         load_in_4bit = quant == "4bit"
@@ -1254,13 +1264,14 @@ def main() -> None:
     else:
         model, tokenizer, is_unsloth = load_lora(args, fmt)
         print(f"== {quant} LoRA (no bitsandbytes) ==")
+    tokenizer = normalize_text_tokenizer(tokenizer)
     # Unsloth sets up its own gradient checkpointing; the native-precision LoRA
     # path needs the trainer to enable it.
     grad_ckpt = quant in ("fp8", "none") and not is_unsloth
 
     liger_on = False
     if not args.no_liger and not is_unsloth:
-        liger_on = apply_liger_laguna(model) or apply_liger_qwen3_5_moe(model) or apply_liger_qwen3_5(model)
+        liger_on = apply_liger_laguna(model) or apply_liger_qwen3_5_moe(model)
         print("liger: fused linear cross-entropy enabled (frees logits VRAM)"
               if liger_on else "liger: not applied (unknown arch); standard loss")
 
@@ -1327,7 +1338,7 @@ def main() -> None:
         **({"eval_strategy": "steps",
             "eval_steps": args.eval_steps,
             "per_device_eval_batch_size": args.batch_size}
-           if eval_dataset is not None else {}),
+           if eval_dataset is not None and not args.no_eval else {}),
     )
     callbacks = []
     if args.eval_gate:
