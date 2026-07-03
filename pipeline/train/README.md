@@ -69,6 +69,11 @@ pip install -U "transformers>=5.7.0" trl peft datasets accelerate unsloth wandb
 transformers` pulls in a broken `torchvision`, reinstall a matching torchvision —
 the Qwen processor imports it.)
 
+Delete `unsloth_compiled_cache/` in your training working directory whenever
+`unsloth`, `unsloth_zoo`, `transformers`, or `flash-linear-attention` versions
+change — Unsloth writes compiled kernels there at import time and the codegen
+bakes in the environment at generation time.
+
 ## Run a cycle
 
 Pull + split the dataset, then train:

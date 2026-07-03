@@ -36,3 +36,6 @@ menubar/*.app
 
 # Generated reports
 pipeline/REPORT.md
+
+# Unsloth codegen cache (written to CWD during training)
+unsloth_compiled_cache/
