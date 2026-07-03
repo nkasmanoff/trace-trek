@@ -199,7 +199,11 @@ def parse_args() -> argparse.Namespace:
                    help="W&B run name (default: auto from data + params)")
     p.add_argument("--no-wandb", action="store_true")
     p.add_argument("--max-samples", type=int, default=0,
-                   help="cap train samples (0 = all); for quick smoke tests")
+                   help="cap train samples (0 = all); for quick smoke tests. "
+                        "Use with --smoke-longest to keep the longest samples.")
+    p.add_argument("--smoke-longest", action="store_true",
+                   help="with --max-samples, sort by len(input_ids) descending "
+                        "before capping (exercises 64k-length rows in smoke runs)")
     # Intermittent eval gate: stand up an in-process OpenAI server backed by the
     # live (in-training) weights and run eval/run_evals.py against it, logging
     # the section pass rates to W&B. See train/eval_server.py.
@@ -1336,9 +1340,19 @@ def main() -> None:
     dataset = load_samples(args.data, tokenizer, fmt_cfg, args.max_seq_len,
                            resp_ids, end_ids, allowed_models)
     if args.max_samples and len(dataset) > args.max_samples:
-        dataset = dataset.select(range(args.max_samples))
-        print(f"smoke: capped train set to {len(dataset)} samples "
-              f"(--max-samples {args.max_samples})")
+        if args.smoke_longest:
+            lengths = [len(row["input_ids"]) for row in dataset]
+            order = sorted(range(len(dataset)),
+                           key=lambda i: lengths[i], reverse=True)
+            picked = order[:args.max_samples]
+            dataset = dataset.select(picked)
+            picked_lens = sorted((lengths[i] for i in picked), reverse=True)
+            print(f"smoke: capped train set to {len(dataset)} longest samples "
+                  f"(--max-samples {args.max_samples}), lengths={picked_lens}")
+        else:
+            dataset = dataset.select(range(args.max_samples))
+            print(f"smoke: capped train set to {len(dataset)} samples "
+                  f"(--max-samples {args.max_samples})")
     eval_dataset = None
     if args.eval_data and Path(args.eval_data).is_file():
         eval_dataset = load_samples(args.eval_data, tokenizer, fmt_cfg,
