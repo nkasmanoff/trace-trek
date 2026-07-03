@@ -32,3 +32,10 @@ compressed-tensors>=0.14
 # Only needed for --quant 4bit (bitsandbytes QLoRA). Discouraged for the Qwen
 # MoE family (large quantization error); kept for the legacy paths.
 bitsandbytes
+
+# Qwen3.6 GatedDeltaNet (48 linear-attn layers) at 64k requires the FLA fast
+# path; without it Unsloth falls back to a torch kernel that OOMs. Pin
+# apache-tvm-ffi: 0.1.12 crashes on import with tilelang (see tilelang#2367).
+flash-linear-attention
+causal-conv1d
+apache-tvm-ffi==0.1.11

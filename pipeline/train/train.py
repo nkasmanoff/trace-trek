@@ -181,6 +181,11 @@ def parse_args() -> argparse.Namespace:
                    help="disable the Liger fused-linear cross-entropy patch "
                         "(it avoids materializing the [seq, vocab] logits "
                         "tensor, so longer context fits in memory)")
+    p.add_argument("--no-unsloth", action="store_true",
+                   help="use transformers + PEFT instead of Unsloth. Required "
+                        "for Qwen3.6 at 64k: Unsloth's compiled linear-attn "
+                        "falls back to a torch path that OOMs; transformers "
+                        "uses flash-linear-attention when installed.")
     p.add_argument("--no-merge", action="store_true",
                    help="skip writing the merged bf16 checkpoint")
     p.add_argument("--wandb-project", default="qwen-sft",
@@ -666,8 +671,12 @@ def load_4bit(args, fmt: str):
         torch_dtype=torch.bfloat16,
         device_map="auto",
         attn_implementation="sdpa",
+        trust_remote_code=True,
     )
-    model = prepare_model_for_kbit_training(model)
+    model.config.use_cache = False
+    if hasattr(model.config, "output_router_logits"):
+        model.config.output_router_logits = False
+    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
     model = get_peft_model(model, lora_config(args, fmt))
     model.print_trainable_parameters()
     return model, tokenizer, False
@@ -1225,9 +1234,12 @@ def main() -> None:
     import torch
     try:
         torch.backends.cuda.enable_cudnn_sdp(False)
-        print("sdpa: cuDNN attention backend disabled (flash/mem-efficient only)")
+        # Math SDPA materializes the full [seq, seq] attention matrix and
+        # OOMs Qwen3.6's 16 full-attention layers at 64k (~17GB/layer in fp32).
+        torch.backends.cuda.enable_math_sdp(False)
+        print("sdpa: cuDNN + math backends disabled (flash/mem-efficient only)")
     except Exception as exc:  # noqa: BLE001
-        print(f"sdpa: could not disable cuDNN backend ({exc!r})")
+        print(f"sdpa: could not configure SDPA backends ({exc!r})")
     fmt = resolve_chat_format(args)
     quant = resolve_quant(args)
     fmt_cfg = CHAT_FORMATS[fmt]
@@ -1248,7 +1260,8 @@ def main() -> None:
     # Unsloth — it handles the text-only path, MoE kernels, and the DeltaNet
     # LoRA targets. We try Unsloth first for both bf16 (`none`) and 4-bit Qwen,
     # falling back to transformers. Other bases keep the original routing.
-    prefer_unsloth = quant == "4bit" or (fmt == "qwen" and quant == "none")
+    prefer_unsloth = ((quant == "4bit" or (fmt == "qwen" and quant == "none"))
+                      and not args.no_unsloth)
     if prefer_unsloth:
         load_in_4bit = quant == "4bit"
         try:
@@ -1266,12 +1279,14 @@ def main() -> None:
         print(f"== {quant} LoRA (no bitsandbytes) ==")
     tokenizer = normalize_text_tokenizer(tokenizer)
     # Unsloth sets up its own gradient checkpointing; the native-precision LoRA
-    # path needs the trainer to enable it.
-    grad_ckpt = quant in ("fp8", "none") and not is_unsloth
+    # and transformers QLoRA paths need the trainer to enable it.
+    grad_ckpt = not is_unsloth
 
     liger_on = False
-    if not args.no_liger and not is_unsloth:
-        liger_on = apply_liger_laguna(model) or apply_liger_qwen3_5_moe(model)
+    if not args.no_liger:
+        liger_on = (apply_liger_laguna(model)
+                    or apply_liger_qwen3_5_moe(model)
+                    or apply_liger_qwen3_5(model))
         print("liger: fused linear cross-entropy enabled (frees logits VRAM)"
               if liger_on else "liger: not applied (unknown arch); standard loss")
 
