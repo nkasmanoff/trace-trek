@@ -1,14 +1,14 @@
 """Produce a *multimodal* merged Qwen3.6 checkpoint and push it to the Hub.
 
-Qwen3.6-35B-A3B is a native multimodal (image-text-to-text) checkpoint whose
-top-level class is Qwen3_5MoeForConditionalGeneration (model_type qwen3_5_moe),
-with a vision tower plus the text tower nested under model.language_model.*.
+Qwen3.6 checkpoints (dense 27B and MoE 35B-A3B) are native multimodal
+(image-text-to-text) models: Qwen3_5ForConditionalGeneration (qwen3_5) or
+Qwen3_5MoeForConditionalGeneration (qwen3_5_moe), with a vision tower plus the
+text tower nested under model.language_model.*.
 
-The original merge loaded the base via AutoModelForCausalLM, which materializes
-only the text backbone (Qwen3_5MoeForCausalLM / qwen3_5_moe_text). save_pretrained
-then wrote a text-only config and dropped the vision tower, so the published
-repo no longer matches the declared base -- which Modal's auto-endpoint
-base-model validator rejects.
+The train.py merge path loads the base via AutoModelForCausalLM, which
+materializes only the text backbone (Qwen3_5ForCausalLM / qwen3_5_text). That
+drops the vision tower and writes a text-only config, so Modal's base-model
+validator rejects the published repo.
 
 Three modes:
 
@@ -38,8 +38,9 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from train import load_dotenv, push_folder_to_hub  # noqa: E402
 
-ADAPTER_DIR = HERE.parent / "outputs" / "adapter"
-MERGED_DIR = HERE.parent / "outputs" / "merged"
+DEFAULT_OUT = HERE / "outputs"
+ADAPTER_DIR = DEFAULT_OUT / "adapter"
+MERGED_DIR = DEFAULT_OUT / "merged"
 REPO = "nkasmanoff/qwen3.6-opencode-lora-merged"
 DEFAULT_BASE = "Qwen/Qwen3.6-35B-A3B"
 # the existing text-only merged checkpoint to graft from
@@ -49,11 +50,20 @@ DEFAULT_SOURCE = REPO
 def load_full_base(base_name: str):
     """Load the full multimodal base on CPU in bf16."""
     import torch
+    from transformers import AutoConfig
 
-    print(f"loading bf16 base on CPU (full multimodal, ~80GB RAM): {base_name}")
-    try:
+    cfg = AutoConfig.from_pretrained(base_name, trust_remote_code=True)
+    mtype = getattr(cfg, "model_type", "")
+    print(f"loading bf16 base on CPU (full multimodal, ~80GB RAM): "
+          f"{base_name} ({mtype})")
+    if "moe" in mtype:
         from transformers import Qwen3_5MoeForConditionalGeneration
-        return Qwen3_5MoeForConditionalGeneration.from_pretrained(
+        cls = Qwen3_5MoeForConditionalGeneration
+    else:
+        from transformers import Qwen3_5ForConditionalGeneration
+        cls = Qwen3_5ForConditionalGeneration
+    try:
+        return cls.from_pretrained(
             base_name, torch_dtype=torch.bfloat16, device_map="cpu",
             trust_remote_code=True,
         )
@@ -67,24 +77,25 @@ def load_full_base(base_name: str):
         )
 
 
-def save_and_verify(base, base_name: str, tok_src: Path | str) -> None:
+def save_and_verify(base, base_name: str, tok_src: Path | str,
+                    merged_dir: Path) -> None:
     """save_pretrained + carry the multimodal processor, then verify."""
     from transformers import AutoTokenizer
 
-    MERGED_DIR.mkdir(parents=True, exist_ok=True)
-    base.save_pretrained(str(MERGED_DIR), safe_serialization=True)
+    merged_dir.mkdir(parents=True, exist_ok=True)
+    base.save_pretrained(str(merged_dir), safe_serialization=True)
     # carry the full multimodal preprocessing config + chat template, not just
     # the bare tokenizer, so the saved repo matches the base for the validator.
     try:
         from transformers import AutoProcessor
         AutoProcessor.from_pretrained(
-            base_name, trust_remote_code=True).save_pretrained(str(MERGED_DIR))
+            base_name, trust_remote_code=True).save_pretrained(str(merged_dir))
     except Exception as exc:
         print(f"AutoProcessor unavailable ({exc!r}); tokenizer only")
     AutoTokenizer.from_pretrained(
-        str(tok_src), trust_remote_code=True).save_pretrained(str(MERGED_DIR))
-    print(f"merged checkpoint -> {MERGED_DIR}")
-    verify_dir(MERGED_DIR)
+        str(tok_src), trust_remote_code=True).save_pretrained(str(merged_dir))
+    print(f"merged checkpoint -> {merged_dir}")
+    verify_dir(merged_dir)
 
 
 def verify_dir(d: Path) -> None:
@@ -105,7 +116,7 @@ def verify_dir(d: Path) -> None:
     print("verify OK: checkpoint matches the multimodal base")
 
 
-def graft(base_name: str, source: str) -> None:
+def graft(base_name: str, source: str, merged_dir: Path) -> None:
     """Overwrite the multimodal base's text tower with the already-merged
     text weights from `source` (a Hub repo id or local dir)."""
     import torch
@@ -149,22 +160,22 @@ def graft(base_name: str, source: str) -> None:
     if missing:
         print(f"WARNING: {len(missing)} source keys had no base target, e.g. "
               f"{missing[:5]}")
-    save_and_verify(base, base_name, src_dir)
+    save_and_verify(base, base_name, src_dir, merged_dir)
 
 
-def remerge(base_name: str) -> None:
+def remerge(base_name: str, adapter_dir: Path, merged_dir: Path) -> None:
     """Re-apply the LoRA adapter onto the full multimodal base."""
     import torch
     from safetensors.torch import load_file
 
-    cfg = json.loads((ADAPTER_DIR / "adapter_config.json").read_text())
+    cfg = json.loads((adapter_dir / "adapter_config.json").read_text())
     r, alpha = cfg["r"], cfg["lora_alpha"]
     scaling = alpha / r
     assert not cfg.get("use_dora") and not cfg.get("use_rslora"), "plain LoRA only"
     print(f"r={r} alpha={alpha} scaling={scaling}")
 
     base = load_full_base(base_name)
-    sd = load_file(str(ADAPTER_DIR / "adapter_model.safetensors"))
+    sd = load_file(str(adapter_dir / "adapter_model.safetensors"))
 
     modules: dict[str, dict] = {}
     for k in sd:
@@ -196,7 +207,13 @@ def remerge(base_name: str) -> None:
         W.data = (W.data.to(torch.float32) + delta).to(W.dtype)
         merged_n += 1
     print(f"applied {merged_n} deltas")
-    save_and_verify(base, base_name, ADAPTER_DIR)
+    save_and_verify(base, base_name, adapter_dir, merged_dir)
+
+
+def merge_qwen_multimodal(base_name: str, adapter_dir: Path,
+                          merged_dir: Path) -> None:
+    """Merge a LoRA adapter into the full multimodal Qwen3.6 base (for train.py)."""
+    remerge(base_name, adapter_dir, merged_dir)
 
 
 def main() -> None:
@@ -208,6 +225,9 @@ def main() -> None:
                    help="full multimodal base model id")
     p.add_argument("--source", default=DEFAULT_SOURCE,
                    help="graft mode: merged text checkpoint (Hub id or dir)")
+    p.add_argument("--adapter-dir", type=Path, default=ADAPTER_DIR)
+    p.add_argument("--merged-dir", type=Path, default=MERGED_DIR)
+    p.add_argument("--repo", default=REPO, help="HF model repo to push")
     p.add_argument("--dry-run", action="store_true",
                    help="only verify an existing merged dir; no load/push")
     p.add_argument("--no-push", action="store_true", help="skip Hub push")
@@ -216,18 +236,18 @@ def main() -> None:
     load_dotenv(HERE)
 
     if args.dry_run:
-        verify_dir(MERGED_DIR)
+        verify_dir(args.merged_dir)
         return
 
     if args.mode == "graft":
-        graft(args.base, args.source)
+        graft(args.base, args.source, args.merged_dir)
     else:
-        remerge(args.base)
+        remerge(args.base, args.adapter_dir, args.merged_dir)
 
     if args.no_push:
         print("--no-push set; skipping Hub push")
         return
-    url = push_folder_to_hub(MERGED_DIR, REPO, private=False)
+    url = push_folder_to_hub(args.merged_dir, args.repo, private=False)
     print(f"DONE merged_push_url={url}")
 
 

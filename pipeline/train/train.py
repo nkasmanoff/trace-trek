@@ -1522,6 +1522,12 @@ def main() -> None:
         model.save_pretrained_merged(
             str(merged_dir), tokenizer, save_method="merged_16bit",
         )
+        print(f"merged checkpoint -> {merged_dir}")
+    elif fmt == "qwen" or "qwen" in (args.base or "").lower():
+        from finalize_merge import merge_qwen_multimodal
+        print("merging adapter into full multimodal Qwen base on CPU "
+              "(needs ~80GB RAM)...")
+        merge_qwen_multimodal(args.base, adapter_dir, merged_dir)
     else:
         # reload base in bf16 and merge the adapter into it
         import torch
@@ -1536,7 +1542,7 @@ def main() -> None:
         merged = merged.merge_and_unload()
         merged.save_pretrained(str(merged_dir), safe_serialization=True)
         tokenizer.save_pretrained(str(merged_dir))
-    print(f"merged checkpoint -> {merged_dir}")
+        print(f"merged checkpoint -> {merged_dir}")
 
     if args.push_to_hub and args.push_merged:
         push_folder_to_hub(merged_dir, args.push_to_hub + "-merged",
